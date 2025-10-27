@@ -61,7 +61,7 @@ colcon build
 source install/setup.bash
 ```
 
-You'll likely have to add network rules to enable communication with the hand. 
+You'll might have to add network rules to enable communication with the hand. 
 
 To test, run the test-script supplied by Tesollo:
 
@@ -79,10 +79,15 @@ ros2 run dg5f_driver dg5f_right_test.py
 
 We have Manus Teleop gloves. From the teleop gloves, we get two types of data: [ergonomics](https://docs.manus-meta.com/2.4.0/Software/Rec/Ergonomics/), and [skeleton data](https://docs.manus-meta.com/2.5.0/Software/Skeletons/).
 
-To install, we follow the [explanation here](https://docs.manus-meta.com/latest/Resources/), and download the `MANUS Core 3 SDK (including ROS2 Package)`.
+To install, we follow the [explanation here](https://docs.manus-meta.com/latest/Resources/), and download the `MANUS Core 3 SDK (including ROS2 Package)`, and unpack it in the `manus` folder in the repo.
+
+```bash
+mkdir manus
+```
+
 You can then follow the [installation instructions here](https://docs.manus-meta.com/latest/Plugins/SDK/getting%20started/), and more specifically, the [Linux instructions here](https://docs.manus-meta.com/latest/Plugins/SDK/Linux/).
 
-Generally, we will run the Manus Software in `integrated` mode.
+Generally, we will run the Manus Software in `integrated` mode, but we still need to install grpc/protobuf.
 
 After installing the required packages, you can build the LinuxClients using 
 ```bash
@@ -93,26 +98,40 @@ in the relevant folder.
 The hands should be calibrated, but if you want to recalibrate, you can follow the [instructions here](https://docs.manus-meta.com/2.4.0/Products/XR%20Metagloves/Calibration/)
 
 #### Bridge to python via ZMQ:
-One possiblity to get the Manus datasomewhere useful is via zmq.
+One possiblity to get the Manus data somewhere useful is via zmq.
 For that, someone modified the manus client slightly:
 - https://github.com/leap-hand/Bidex_Manus_Teleop?tab=readme-ov-file
 
+To keep the folders somewhat organized, we put this in the folder `zmq_manus`
 
-We can test if this was succesful by starting the modified client:
 ```bash
+mkdir zmq_manus
+cd zmq_manus
+git clone git@github.com:leap-hand/Bidex_Manus_Teleop.git
+cd Bidex_Manus_Teleop/MANUS_Core_2.4.0_SDK/SDKClient_Linux
+make
 ```
 
-and then running 
+We can test if this was succesful by starting the modified client, and pressing `1` for starting integrated mode.
+
+and then in a separate terminal running 
+
 ```bash
+uv run scripts/plot.py
 ```
 
 to plot our hand from the skeleton data.
-The result should look roughly like this:
-...
 
 #### Using ROS2 for Manus
 - [ ] TODO: look at ROS2 node.
 
+## Retargeting
+
+#### GeoRT
+
+We clone [GeoRT](https://github.com/facebookresearch/GeoRT) into `retargeting`.
+
+..
 
 ## Pose estimation for simple objects
 We use aruco marker, and/or april tags for board pose estimation
