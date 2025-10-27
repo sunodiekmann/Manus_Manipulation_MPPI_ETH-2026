@@ -13,17 +13,30 @@ This repo contains all necessary stuff for setting up the required things for th
 
 Skip whatever you do not need below.
 
+We will put all the things below in separate subfolders.
+Start by cloning this repo, and running
+
+```bash
+cd <where_you_cloned_this>
+# mkdir scripts
+# mkdir core
+git clone ..
+mkdir manus
+
+```
+
 ## Tesollo robot hand
 To control the robot hand, we need to set up the sources for ROS2:
 - [follow the instructions linked here](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html)
 
 We will need the following packages from ROS2 that we can then install via apt if the setup above was successful:
 ```bash
-sudo apt install ros-humble-desktop
-sudo apt install ros-humble-xacro
-sudo apt install ros-humble-launch-ros
-sudo apt install ros-humble-hardware-interface
-sudo apt install ros-humble-ros2-control ros-humble-ros2-controllers
+sudo apt install ros-humble-desktop-full
+sudo apt install ros-dev-tools
+# sudo apt install ros-humble-xacro
+# sudo apt install ros-humble-launch-ros
+# sudo apt install ros-humble-hardware-interface
+# sudo apt install ros-humble-ros2-control ros-humble-ros2-controllers
 ```
 
 after installation, source the env
@@ -34,7 +47,18 @@ We then set up the ROS2 stuff for our robot hand. You'll need to clone the repo 
 Particularly:
 
 ```bash
-...
+mkdir tesollo
+cd tesollo
+git clone git@github.com:Tesollo-Delto/DELTO_M_ROS2.git
+cd ..
+rosdep install --from-paths tesollo --ignore-src -r -y
+```
+
+and after 
+
+```bash
+colcon build
+source install/setup.bash
 ```
 
 You'll likely have to add network rules to enable communication with the hand. 
@@ -42,7 +66,13 @@ You'll likely have to add network rules to enable communication with the hand.
 To test, run the test-script supplied by Tesollo:
 
 ```bash
-...
+ros2 launch dg5f_driver dg5f_right_driver.launch.py
+```
+
+and in a separate terminal
+
+```bash
+ros2 run dg5f_driver dg5f_right_test.py
 ```
 
 ## Manus
