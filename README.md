@@ -78,6 +78,10 @@ We work with the `MANUS Core 3 SDK (including ROS2 Package)`, which can be [foun
 
 Since we apply some changes, we maintain aversion on github, which was cloned as a submodule above.
 
+Ssince some of the files included (specifically, all the `.so` files) are too big to be tracked in github directly, we use git lfs to track them.
+
+Therefore, in addition to the instructions below, we need to go into the manus-folder, and run `git lfs pulll`.
+
 The original installation instructions are still applicable:
 The original instructions can be found [on their website](https://docs.manus-meta.com/latest/Plugins/SDK/getting%20started/), and more specifically, the [Linux instructions](https://docs.manus-meta.com/latest/Plugins/SDK/Linux/).
 
