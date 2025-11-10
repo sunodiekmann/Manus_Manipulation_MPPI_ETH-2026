@@ -4,3 +4,6 @@
 [submodule "ros_ws/src/delto_m_ros2"]
 	path = ros_ws/src/delto_m_ros2
 	url = git@github.com:vhartman/DELTO_M_ROS2.git
+[submodule "src/manus"]
+	path = src/manus
+	url = git@github.com:vhartman/manus_teleop.git
