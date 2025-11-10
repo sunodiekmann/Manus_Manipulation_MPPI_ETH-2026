@@ -1,0 +1,6 @@
+[submodule "src/geort"]
+	path = src/geort
+	url = git@github.com:vhartman/GeoRT.git
+[submodule "ros_ws/src/delto_m_ros2"]
+	path = ros_ws/src/delto_m_ros2
+	url = git@github.com:vhartman/DELTO_M_ROS2.git
