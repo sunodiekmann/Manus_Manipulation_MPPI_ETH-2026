@@ -56,7 +56,8 @@ colcon build
 source install/setup.bash
 ```
 
-You'll might have to add network rules to enable communication with the hand. 
+You'll might have to add network rules to enable communication with the hand:
+You'll have to add a network profile with address `169.254.186.0` and netmask `255.255.255.0` to enable communication with the robot.
 
 To test, run the test-script supplied by Tesollo (in the ros_ws-dir):
 
