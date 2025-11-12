@@ -7,3 +7,6 @@
 [submodule "src/manus"]
 	path = src/manus
 	url = git@github.com:vhartman/manus_teleop.git
+[submodule "src/mujoco_playground"]
+	path = src/mujoco_playground
+	url = git@github.com:google-deepmind/mujoco_playground.git
