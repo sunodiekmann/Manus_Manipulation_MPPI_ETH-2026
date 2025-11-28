@@ -17,6 +17,11 @@ from rclpy.node import Node
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
+from scipy.spatial.transform import Rotation as R
+
+from manus_skeleton_receiver import ManusSkeletonReceiver
+from manus_ergonomics_receiver import ManusErgonomicsReceiver
+
 import time
 
 import sys
@@ -30,117 +35,43 @@ from keyboard_util import KeyboardThread, get_keyboard_flag, reset_keyboard_flag
 _HERE = Path(__file__).parent
 _XML = _HERE / ".." / "output_mocap.xml"
 
-class ManusSkeletonReceiver:
-    '''
-    Applies to any ZMQ-broadcasted mocap data with fixed shape (21,3) and dtype float32.
-    Runs a background thread to continuously receive and update latest data.
-    '''
-    def __init__(self, port=8000, glove_serial_number="dc8b6ba8"):
-        self.serial_number = glove_serial_number
-
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.PULL)
-        self.socket.setsockopt(
-            zmq.CONFLATE, 1
-        )  # Keep only the latest message
-        self.socket.connect(f"tcp://localhost:{port}")
-
-        self._latest_data = None
-        self._lock = threading.Lock()
-        self._running = True
-        self._thread = threading.Thread(target=self._recv_loop, daemon=True)
-        self._thread.start()
-
-        self.fingertip_indices = [4, 9, 14, 19, 24]
-
-    def _recv_loop(self):
-
-        # ordered as thumb, index, middle, ring, little
-        chain_order = [
-            0, 21, 22, 23, 24, 
-            1, 2, 3, 4, 5,
-            6, 7, 8, 9, 10,
-            16, 17, 18, 19, 20,
-            11, 12, 13, 14, 15,
-        ]
-
-        theta = np.pi / 2  # 90 degrees
-        Rz = np.array([
-            [np.cos(theta), -np.sin(theta), 0],
-            [np.sin(theta),  np.cos(theta), 0],
-            [0, 0, 1]
-        ])
-
-        while self._running:
-            try:
-                message = self.socket.recv()
-                message = message.decode('utf-8')
-                data = message.split(",")
-
-                assert len(data) == 176
-
-                serial_number = data[0]
-                assert serial_number == self.serial_number
-
-                positions = np.array(data[1:], dtype=float).reshape(-1, 7)[:, :3]
-                positions = positions[chain_order, :]
-
-                positions[:, 0] = -positions[:, 0]
-
-                positions = positions @ Rz.T
-
-                with self._lock:
-                    self._latest_data = positions
-            except zmq.Again:
-                import time
-                time.sleep(0.001)
-
-    def get(self):
-        with self._lock:
-            if self._latest_data is not None:
-                return {"result": self._latest_data.copy(), "status": "recording"}
-            else:
-                return {"result": None, "status": "no data"}
-            
-    def get_fingertips(self):
-        with self._lock:
-            if self._latest_data is not None:
-                return self._latest_data[self.fingertip_indices, :]
-            else:
-                return None
-
-
-    def close(self):
-        self._running = False
-        self._thread.join()
-        self.socket.close()
-
-
 class MujocoRetargeting:
     def __init__(self):
         self.model = mujoco.MjModel.from_xml_path(_XML.as_posix())
 
         self.mocap = ManusSkeletonReceiver()
+        self.ergonomics = ManusErgonomicsReceiver()
+        self.ergonomics.start()
 
         self.configuration = mink.Configuration(self.model)
 
-        self.posture_task = mink.PostureTask(self.model, cost=1e-2)
+        self.posture_task = mink.PostureTask(self.model, cost=5e-2)
 
         self.finger_pairs = [
             (0, 1),
             (0, 2),
             (0, 3),
             (0, 4),
+
+            # (1, 2),
+            # (1, 3),
+            # (1, 4),
+
+            # (2, 3),
+            # (2, 4),
+
+            # (3, 4),
         ]
 
         self.fingers = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "little_tip"]
         self.finger_tasks = []
         for finger in self.fingers:
+            # if finger == "thumb_tip":
             task = mink.FrameTask(
                 frame_name=finger,
                 frame_type="geom",
-                position_cost=0.7,
-                orientation_cost=0.0,
+                position_cost=1.0,
+                orientation_cost=0.01,
                 lm_damping=1.0,
             )
             self.finger_tasks.append(task)
@@ -152,9 +83,9 @@ class MujocoRetargeting:
                 frame_type="geom",
                 root_name=self.fingers[idx2],
                 root_type="geom",
-                position_cost=1.0,
-                orientation_cost=0.0,
-                lm_damping=1.0,
+                position_cost=1,
+                orientation_cost=.0,
+                lm_damping=0.1,
             )
             self.relative_finger_tasks.append(task)
 
@@ -167,26 +98,30 @@ class MujocoRetargeting:
 
         self.limits = [
             mink.ConfigurationLimit(model=self.model),
-            # mink.CollisionAvoidanceLimit(model=self.model, geom_pairs=collision_pairs),
+            # mink.CollisionAvoidanceLimit(model=model, geom_pairs=collision_pairs),
         ]
 
         self.tasks = [
             self.posture_task,
             *self.finger_tasks,
-            # *relative_finger_tasks
+            *self.relative_finger_tasks
         ]
 
         self.model = self.configuration.model
         self.data = self.configuration.data
         self.solver = "daqp"
 
-
-        self.scale = 1.35
-        self.offsets = {"thumb_tip": np.array([0.02, 0, 0]),
-                "index_tip": np.array([0.02, 0, 0]), 
-                "middle_tip": np.array([0.02, 0, 0]), 
-                "ring_tip": np.array([0.02, 0, 0]), 
-                "little_tip": np.array([0.02, 0, 0])}
+        self.scale = 1.
+        common_x_offset = 0.04
+        common_y_offset = -0.00
+        common_z_offset = 0.05
+        self.offsets = {"thumb_tip": np.array([common_x_offset, common_y_offset, common_z_offset]),
+                "index_tip": np.array([common_x_offset, common_y_offset, common_z_offset]), 
+                "middle_tip": np.array([common_x_offset, common_y_offset, common_z_offset]), 
+                "ring_tip": np.array([common_x_offset, common_y_offset, common_z_offset]), 
+                "little_tip": np.array([common_x_offset, common_y_offset, common_z_offset])}
+        self.r_x = R.from_euler('x', 90, degrees=True)
+        self.r_z = R.from_euler('z', -90, degrees=True)
         
         self._lock = threading.Lock()
         self._running = True
@@ -213,24 +148,45 @@ class MujocoRetargeting:
             t = 0
             while viewer.is_running() and self._running:
                 # get task target from mocap
-                fingertip_positions = self.mocap.get_fingertips()
+                fingertip_positions = self.mocap.get_fingertip_pos()
+                fingertip_quats = self.mocap.get_fingertip_quat()
+
+                angles = self.ergonomics.get_angles_in_rad()
+
                 if fingertip_positions is not None:
                     # set mocap objects to fingetips from manus
                     for i, finger in enumerate(self.fingers):
                         mocap_id = self.model.body(f"{finger}_target").mocapid[0]
 
-                        pos = (fingertip_positions[i] + self.offsets[finger]) * self.scale
-                        self.data.mocap_pos[mocap_id] = pos.copy()
+                        pos = fingertip_positions[i]
+                        self.data.mocap_pos[mocap_id] = pos.copy() * self.scale + self.offsets[finger]
 
-                    # for (idx1, idx2), task in zip(finger_pairs, relative_finger_tasks):
-                    #     translation = fingertip_positions[idx1] - fingertip_positions[idx2]
-                    #     print(idx1, idx2, translation)
-                    #     T = mink.SE3.from_translation(translation)
-                    #     task.set_target(T)
-                # else:
-                #     for (idx1, idx2), task in zip(finger_pairs, relative_finger_tasks):
-                #         T = mink.SE3.identity()
-                #         task.set_target(T)
+                        quat = fingertip_quats[i]
+                        q_rotated = R.from_quat(quat) * self.r_x * self.r_z 
+
+                        if finger == "thumb_tip":
+                            q_rotated = q_rotated * self.r_x * self.r_x
+
+                        # convert back to quaternion (with scalar first)
+                        self.data.mocap_quat[mocap_id] = q_rotated.as_quat(scalar_first=True)
+
+
+                    for (idx1, idx2), task in zip(self.finger_pairs, self.relative_finger_tasks):
+                        finger_1 = self.fingers[idx1]
+                        finger_2 = self.fingers[idx2]
+
+                        T_pm = self.configuration.get_transform(
+                            f"{finger_1}_target", "body", f"{finger_2}_target", "body"
+                        )
+
+                        task.set_target(T_pm)
+                else:
+                    for (idx1, idx2), task in zip(self.finger_pairs, self.relative_finger_tasks):
+                        T = mink.SE3.identity()
+                        task.set_target(T)
+
+                if angles is not None:
+                    self.posture_task.set_target(angles)
 
                 # Update task target.
                 for finger, task in zip(self.fingers, self.finger_tasks):

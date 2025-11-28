@@ -22,7 +22,7 @@ context = zmq.Context()
 print("Connecting to SDK")
 socket = context.socket(zmq.PULL)
 socket.setsockopt(zmq.CONFLATE, True)     
-socket.connect("tcp://localhost:8000")
+socket.connect("tcp://localhost:8001")
 
 '''
 This is ordered from Thumb to pinky, palm out to fingertip. 
@@ -48,8 +48,8 @@ mj_data = mujoco.MjData(model)
 viewer = mujoco.viewer.launch_passive(model, mj_data)
 
 def right_ergonomics_to_mujoco(ergonomics_data):
-    ergonomics_data[1] = ergonomics_data[1] - 70.
-    ergonomics_data[2] = ergonomics_data[2] + 45.
+    ergonomics_data[1] = ergonomics_data[1] - 90.
+    ergonomics_data[2] = ergonomics_data[2]
 
     for i in [1, 2, 3]:
         ergonomics_data[i * 4] = -ergonomics_data[i*4] + 0.
@@ -59,16 +59,17 @@ def right_ergonomics_to_mujoco(ergonomics_data):
     ergonomics_data[1] = tmp
 
     ergonomics_data[0] = -ergonomics_data[0]
-    ergonomics_data[1] = -ergonomics_data[1]
+    ergonomics_data[1] = -ergonomics_data[1] - 45
 
     tmp = ergonomics_data[16]
     ergonomics_data[16] = ergonomics_data[17] * 0.5
     ergonomics_data[17] = -tmp
 
-    ergonomics_data[16] = 0
-    ergonomics_data[17] = 0
-    ergonomics_data[18] = 0
-    ergonomics_data[19] = 0
+    
+    # ergonomics_data[16] = 0
+    # ergonomics_data[17] = 0
+    # ergonomics_data[18] = 0
+    # ergonomics_data[19] = 0
 
     return ergonomics_data
 
