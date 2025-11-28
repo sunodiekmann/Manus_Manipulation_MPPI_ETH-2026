@@ -9,7 +9,7 @@
 	url = git@github.com:vhartman/manus_teleop.git
 [submodule "src/mujoco_playground"]
 	path = src/mujoco_playground
-	url = git@github.com:google-deepmind/mujoco_playground.git
+	url = git@github.com:vhartman/mujoco_playground.git
 [submodule "src/tag-pose-estimation"]
 	path = src/tag-pose-estimation
 	url = git@gitlab.inf.ethz.ch:crl/tag-pose-estimation.git
