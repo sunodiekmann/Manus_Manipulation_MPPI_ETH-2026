@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 
-left_glove_sn = "60f3738b"
+left_glove_sn = "5186fac7"
 right_glove_sn = "dc8b6ba8"
 
 context = zmq.Context()
