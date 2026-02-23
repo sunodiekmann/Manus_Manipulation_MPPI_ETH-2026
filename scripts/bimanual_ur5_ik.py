@@ -91,7 +91,7 @@ class CSVReader:
             return data
 
 WITH_ROBOT = False
-FROM_CSV = True
+FROM_CSV = False
 
 if __name__ == "__main__":
     model = mujoco.MjModel.from_xml_path(_XML.as_posix())

@@ -40,7 +40,8 @@ class ManusErgonomicsReceiver():
         self.socket = None
 
         self.update_rate = update_rate
-        self.pose = np.zeros(20)
+        self.left_pose = np.zeros(20)
+        self.right_pose = np.zeros(20)
 
         self._running = False
         self._thread = None
@@ -104,7 +105,13 @@ class ManusErgonomicsReceiver():
                         right_hand_ergonomics = right_ergonomics_to_mujoco(right_hand_ergonomics)
 
                         with self._lock:
-                            self.pose = np.array(right_hand_ergonomics) / 360 * 2 * np.pi
+                            self.right_pose = np.array(right_hand_ergonomics) / 360 * 2 * np.pi
+                        
+                        left_hand_ergonomics = list(map(float,data[0:20]))
+                        left_hand_ergonomics = right_ergonomics_to_mujoco(left_hand_ergonomics)
+
+                        with self._lock:
+                            self.left_pose = np.array(left_hand_ergonomics) / 360 * 2 * np.pi
 
                 except zmq.Again:
                     pass
@@ -120,4 +127,12 @@ class ManusErgonomicsReceiver():
 
     def get_angles_in_rad(self):
          with self._lock:
-            return self.pose.tolist()
+            return self.right_pose.tolist()    
+         
+    def get_left_angles_in_rad(self):
+         with self._lock:
+            return self.left_pose.tolist()
+         
+    def get_right_angles_in_rad(self):
+         with self._lock:
+            return self.right_pose.tolist()

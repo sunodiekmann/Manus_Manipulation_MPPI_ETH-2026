@@ -34,13 +34,15 @@ class WristPoseReceiver:
         self.estimator = BoardPoseEstimator(f"tcp://localhost:{config['port']}")
         self.estimator.start()
 
-    def get_wrist_pose(self):
+    def get_wrist_pose(self, id=None):
         # Receive pose data
         ids = self.estimator.get_tracked_board_ids()
 
         for box_id in ids:
             box_pose = self.estimator.get_pose(box_id)
-            return box_pose
+
+            if id is None or box_id == id:
+                return box_pose
 
 
 WITH_ROBOT = True
