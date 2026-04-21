@@ -16,3 +16,6 @@
 [submodule "src/robot_ipc_control"]
 	path = src/robot_ipc_control
 	url = git@github.com:vhartman/robot_ipc_control.git
+[submodule "src/dexmachina"]
+	path = src/dexmachina
+	url = https://github.com/MandiZhao/dexmachina.git
