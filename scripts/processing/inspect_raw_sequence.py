@@ -1,3 +1,17 @@
+"""
+Inspect a raw recording directly from the JSONL event streams.
+
+Input:  recordings/<session>/hands.jsonl, ergonomics.jsonl, poses.jsonl
+
+What it does:
+  - Loads the raw, unsynchronised event streams as recorded by record_demo_sequence.py.
+  - Plots per-stream timestamps, arrival rates, and raw data values so you can
+    quickly sanity-check whether all streams were running and at what frequency.
+  - Useful for diagnosing recording issues (missing streams, dropped packets,
+    timestamp jitter) before committing to the full processing pipeline.
+
+Run after recording, before build_sequence_dataset.py.
+"""
 import json
 from pathlib import Path
 
@@ -6,9 +20,11 @@ import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 
 
-HANDS_PATH = Path("recordings/statics/session_20260421_150421/hands.jsonl")
-ERGONOMICS_PATH = Path("recordings/statics/session_20260421_150421/ergonomics.jsonl")
-POSES_PATH = Path("recordings/statics/session_20260421_150421/poses.jsonl")
+import sys as _sys
+_session = Path(_sys.argv[1]) if len(_sys.argv) > 1 else Path("recordings/statics/session_20260421_150421")
+HANDS_PATH      = _session / "hands.jsonl"
+ERGONOMICS_PATH = _session / "ergonomics.jsonl"
+POSES_PATH      = _session / "poses.jsonl"
 
 
 def load_jsonl(path):

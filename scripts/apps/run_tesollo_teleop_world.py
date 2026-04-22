@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import mujoco
 import mujoco.viewer
 from loop_rate_limiters import RateLimiter
@@ -25,7 +23,7 @@ from scripts.retargeting.tesollo_runtime_baseline import (
     update_fingertip_targets_world_frame,
     update_relative_finger_targets,
     reset_relative_finger_targets,
-    update_posture_target_from_full_qpos,
+    update_posture_target_from_joint_angles,
     update_finger_frame_tasks_from_mocaps,
     solve_ik_step,
 )
@@ -100,9 +98,6 @@ def main():
                         T_world_from_body=T_world_from_cube,
                     )
 
-                if T_world_from_wrist is not None:
-                    set_hand_base_pose(model, data, T_world_from_wrist)
-
                 has_targets = update_fingertip_targets_world_frame(
                     model=model,
                     data=data,
@@ -119,7 +114,7 @@ def main():
                 else:
                     reset_relative_finger_targets(task_bundle)
 
-                update_posture_target_from_full_qpos(task_bundle, data, angles)
+                update_posture_target_from_joint_angles(task_bundle, angles)
                 update_finger_frame_tasks_from_mocaps(model, data, task_bundle)
 
                 solve_ik_step(task_bundle, dt=rate.dt)

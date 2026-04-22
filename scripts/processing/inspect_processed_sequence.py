@@ -1,3 +1,21 @@
+"""
+Inspect a processed sequence (.npz) with interactive plots.
+
+Input:  recordings/<session>/processed_sequence.npz
+
+What it does:
+  - Loads a sequence built by build_sequence_dataset.py.
+  - Prints a text summary: frame count, timing statistics, max speed, max
+    orientation jumps per stream.
+  - Plots position trajectories, Euler-angle orientations, speed magnitudes,
+    and frame-to-frame orientation jumps for the left/right board poses, cube
+    pose, and both wrist transforms.
+  - Useful for verifying that the synchronisation, interpolation, and
+    wrist→world transform are working correctly before running downstream
+    processing (compute_proxy_geometry) or evaluation.
+
+Run after build_sequence_dataset.py.
+"""
 import json
 from pathlib import Path
 
@@ -6,7 +24,9 @@ import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 
 
-INPUT_PATH = Path("recordings/statics/session_20260421_150421/processed_sequence.npz")
+import sys as _sys
+_arg = Path(_sys.argv[1]) if len(_sys.argv) > 1 else Path("recordings/statics/session_20260421_150421")
+INPUT_PATH = _arg if _arg.suffix == ".npz" else _arg / "processed_sequence.npz"
 
 
 def load_processed(path: Path):

@@ -14,7 +14,7 @@ from scripts.utils.config import (
     CUBE_ID,
 )
 
-DURATION_SEC = 4.0
+DURATION_SEC = 10.0
 
 OUTPUT_ROOT = Path("recordings")
 SESSION_NAME = time.strftime("session_%Y%m%d_%H%M%S")

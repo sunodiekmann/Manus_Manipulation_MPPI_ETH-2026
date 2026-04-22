@@ -48,11 +48,13 @@ def map_world_frame_target(
     if offsets is None:
         offsets = DEFAULT_TARGET_OFFSETS
 
+    # Apply scale and offset in wrist frame first, then transform to world.
+    # This mirrors map_wrist_frame_target — offsets are wrist-relative, not world-relative.
+    pos_wrist_adjusted = np.asarray(pos_wrist, dtype=float) * scale + offsets[finger]
     pos_world, q_world = wrist_to_world_target(
-        pos_wrist,
+        pos_wrist_adjusted,
         quat_wrist_xyzw,
         finger,
         T_world_from_wrist,
     )
-    pos_target = pos_world * scale + offsets[finger]
-    return pos_target, q_world
+    return pos_world, q_world

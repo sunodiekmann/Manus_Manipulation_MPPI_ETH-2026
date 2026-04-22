@@ -1,3 +1,23 @@
+"""
+Extend a processed sequence with derived fingertip geometry (proxy geometry).
+
+Input:  recordings/<session>/processed_sequence.npz
+Output: recordings/<session>/processed_sequence_with_proxy.npz
+
+What it does:
+  - Extracts the 5 fingertip positions (thumb → little) from the 25-joint hand
+    skeleton for every frame, in both wrist frame and world frame.
+  - Computes the fingertip direction vectors (unit vectors from the pre-tip joint
+    to the tip joint), also in both frames.
+  - Transforms fingertip positions and wrist transforms into the cube frame using
+    the live cube pose, producing cube-relative representations that are useful
+    for calibration evaluation and imitation learning.
+  - All outputs use object arrays (None for frames where a stream was unavailable).
+
+Usage:
+    python -m scripts.processing.compute_proxy_geometry                                             # uses hardcoded path
+    python -m scripts.processing.compute_proxy_geometry recordings/<session>/processed_sequence.npz
+"""
 import numpy as np
 from pathlib import Path
 
