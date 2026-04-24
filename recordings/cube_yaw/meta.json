@@ -1,0 +1,13 @@
+{
+  "session_name": "session_20260424_114311",
+  "start_wall_time": 1777023791.1868908,
+  "duration_sec": 10.0,
+  "manus_port": 8000,
+  "pose_port": 5557,
+  "img_port": 5558,
+  "left_glove_serial_number": "5186fac7",
+  "right_glove_serial_number": "dc8b6ba8",
+  "left_board_id": "0",
+  "right_board_id": "1",
+  "cube_id": "2"
+}

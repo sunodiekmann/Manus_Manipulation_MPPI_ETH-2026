@@ -105,19 +105,24 @@ class ManusErgonomicsReceiver():
                     # print("Received reply %s" % (message))
                     data = message.split(",") 
                     if len(data) == 40:
-                        right_hand_ergonomics = list(map(float,data[20:40]))
-                        right_hand_ergonomics = right_ergonomics_to_mujoco(right_hand_ergonomics)
+                        right_raw = list(map(float, data[20:40]))
+                        left_raw  = list(map(float, data[0:20]))
 
-                        with self._lock:
-                            self.right_pose = np.array(right_hand_ergonomics) / 360 * 2 * np.pi
-                            self.right_timestamp = recv_timestamp
-                        
-                        left_hand_ergonomics = list(map(float,data[0:20]))
-                        left_hand_ergonomics = right_ergonomics_to_mujoco(left_hand_ergonomics)
+                        # Only update a hand if the SDK is actually sending real data
+                        # for it.  A disconnected glove produces an all-zero payload;
+                        # updating the timestamp on zero data causes the recording
+                        # script to log spurious entries for an inactive glove.
+                        if np.max(np.abs(right_raw)) > 0.5:
+                            right_hand_ergonomics = right_ergonomics_to_mujoco(right_raw)
+                            with self._lock:
+                                self.right_pose = np.array(right_hand_ergonomics) / 360 * 2 * np.pi
+                                self.right_timestamp = recv_timestamp
 
-                        with self._lock:
-                            self.left_pose = np.array(left_hand_ergonomics) / 360 * 2 * np.pi
-                            self.left_timestamp = recv_timestamp
+                        if np.max(np.abs(left_raw)) > 0.5:
+                            left_hand_ergonomics = right_ergonomics_to_mujoco(left_raw)
+                            with self._lock:
+                                self.left_pose = np.array(left_hand_ergonomics) / 360 * 2 * np.pi
+                                self.left_timestamp = recv_timestamp
 
                 except zmq.Again:
                     pass

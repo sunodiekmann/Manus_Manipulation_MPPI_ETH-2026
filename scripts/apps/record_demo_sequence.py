@@ -54,7 +54,6 @@ def main():
         "left_board_id": LEFT_BOARD_ID,
         "right_board_id": RIGHT_BOARD_ID,
         "cube_id": CUBE_ID,
-        "notes": "Raw recording. No synchronization, filtering, or resampling applied.",
     }
 
     with open(META_PATH, "w") as f:

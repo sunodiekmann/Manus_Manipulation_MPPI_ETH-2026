@@ -45,12 +45,19 @@ RIGHT_CALIB_JSON = "src/tag-pose-estimation/config/calibration_gloves/right_wris
 TARGET_HZ = 20.0
 
 # ── filter / outlier settings ─────────────────────────────────────────────────
-# Tag-pose outlier rejection: frames where position or orientation jumps more
-# than these thresholds relative to the previous accepted frame are discarded
-# (set to None) before filtering.  False-tracking events typically jump tens of
-# cm / tens of degrees; legitimate fast motion at 20 Hz is <5 cm / <15 deg.
-OUTLIER_MAX_POS_JUMP_M   = 0.06   # 6 cm  → ~1.2 m/s at 20 Hz
-OUTLIER_MAX_ROT_JUMP_DEG = 20.0   # 20°   → 400 °/s at 20 Hz
+# Tag-pose outlier rejection is done on the RAW rows BEFORE SLERP resampling.
+# This matters: post-resample rejection misses outliers that SLERP already
+# smeared across several frames (a 26° raw jump becomes 4–8°/frame bumps that
+# slip through any reasonable per-frame threshold).
+#
+# Thresholds are speed-based so they are independent of the raw frame rate.
+# Tune these for your motion: typical manipulation tasks have <60 deg/s and
+# <0.15 m/s.  False ArUco detections jump at 100–700 deg/s.
+OUTLIER_MAX_POS_SPEED_M_S   = 0.05   # 5 cm/s  — cube movements are mostly rotation; any real translation is slow
+OUTLIER_MAX_ROT_SPEED_DEG_S = 80.0   # 80 deg/s — false detections: 130–700 deg/s
+# After a false detection the tracker takes a few frames to settle back.
+# This many raw frames after each rejected frame are also dropped.
+OUTLIER_RECOVERY_FRAMES = 4
 
 # Low-pass filter for tag poses (translation + quaternion) after outlier removal.
 # 3 Hz removes residual jitter from the pose estimator without blurring the motion.
@@ -224,43 +231,60 @@ def filter_object_seq(seq: list, cutoff_hz: float, sample_hz: float) -> list:
 
 # ── outlier rejection ────────────────────────────────────────────────────────
 
-def reject_pose_outliers(pose_seq: list, max_pos_jump_m: float, max_rot_jump_deg: float) -> list:
+def reject_raw_pose_outlier_rows(
+    rows: list,
+    max_pos_speed_m_s: float,
+    max_rot_speed_deg_s: float,
+    recovery_frames: int = 4,
+) -> list:
     """
-    Mark pose frames as None when the position or orientation change from the
-    last accepted frame exceeds the threshold.  False-tracking events produce
-    large sudden jumps; this removes them before filtering.
+    Remove raw JSONL pose rows whose implied speed exceeds the threshold, plus
+    the next `recovery_frames` rows after each bad frame.  Applied BEFORE SLERP
+    resampling so interpolation never touches bad frames.
+
+    The recovery window matters because false ArUco detections typically disturb
+    the tracker for several frames after the bad detection; those recovery frames
+    look individually plausible but are still biased toward the wrong pose.
     """
-    result = list(pose_seq)
+    cleaned = []
+    prev_ts = None
     prev_pos = None
     prev_q_xyzw = None
+    skip_remaining = 0   # countdown of recovery frames still to drop
 
-    for i, p in enumerate(result):
-        if p is None:
+    for r in rows:
+        if skip_remaining > 0:
+            skip_remaining -= 1
             continue
-        p = np.asarray(p, dtype=float)
+
+        ts = float(r["timestamp"])
+        p = np.asarray(r["pose_world"], dtype=float)
         pos = p[:3]
         qw, qx, qy, qz = p[3:]
         q_xyzw = np.array([qx, qy, qz, qw])
 
-        rejected = False
+        accept = True
+        if prev_ts is not None:
+            dt = ts - prev_ts
+            if dt > 1e-6:
+                if np.linalg.norm(pos - prev_pos) / dt > max_pos_speed_m_s:
+                    accept = False
 
-        if prev_pos is not None:
-            if np.linalg.norm(pos - prev_pos) > max_pos_jump_m:
-                rejected = True
+                if accept:
+                    q_cmp = q_xyzw if np.dot(q_xyzw, prev_q_xyzw) >= 0 else -q_xyzw
+                    rel = Rotation.from_quat(prev_q_xyzw).inv() * Rotation.from_quat(q_cmp)
+                    if np.rad2deg(rel.magnitude()) / dt > max_rot_speed_deg_s:
+                        accept = False
 
-        if not rejected and prev_q_xyzw is not None:
-            q_cmp = q_xyzw if np.dot(q_xyzw, prev_q_xyzw) >= 0 else -q_xyzw
-            rel = Rotation.from_quat(prev_q_xyzw).inv() * Rotation.from_quat(q_cmp)
-            if np.rad2deg(rel.magnitude()) > max_rot_jump_deg:
-                rejected = True
-
-        if rejected:
-            result[i] = None
-        else:
+        if accept:
+            cleaned.append(r)
+            prev_ts = ts
             prev_pos = pos
             prev_q_xyzw = q_xyzw
+        else:
+            skip_remaining = recovery_frames
 
-    return result
+    return cleaned
 
 
 # ── world-frame transform ─────────────────────────────────────────────────────
@@ -301,6 +325,15 @@ def main():
     T_board_wrist_left  = load_calibration_matrix(LEFT_CALIB_JSON)
     T_board_wrist_right = load_calibration_matrix(RIGHT_CALIB_JSON)
 
+    # ── outlier rejection on raw rows (before SLERP) ─────────────────────────
+    print(f"Rejecting raw pose outliers (pos>{OUTLIER_MAX_POS_SPEED_M_S:.2f} m/s, rot>{OUTLIER_MAX_ROT_SPEED_DEG_S:.0f} deg/s) …")
+    for stream in ("left_board", "right_board", "cube"):
+        raw = poses.get(stream, [])
+        cleaned = reject_raw_pose_outlier_rows(raw, OUTLIER_MAX_POS_SPEED_M_S, OUTLIER_MAX_ROT_SPEED_DEG_S, OUTLIER_RECOVERY_FRAMES)
+        if len(cleaned) < len(raw):
+            print(f"  {stream}: removed {len(raw) - len(cleaned)} / {len(raw)} raw frames")
+        poses[stream] = cleaned
+
     # ── resample onto uniform timeline ────────────────────────────────────────
     left_joints_wrist_seq  = [interp_hand_joints(hands.get("left_hand",  []), t) for t in timeline]
     right_joints_wrist_seq = [interp_hand_joints(hands.get("right_hand", []), t) for t in timeline]
@@ -311,12 +344,6 @@ def main():
     left_board_pose_seq  = [interp_pose_slerp(poses.get("left_board",  []), t) for t in timeline]
     right_board_pose_seq = [interp_pose_slerp(poses.get("right_board", []), t) for t in timeline]
     cube_pose_seq        = [interp_pose_slerp(poses.get("cube",        []), t) for t in timeline]
-
-    # ── outlier rejection for tag poses ──────────────────────────────────────
-    print(f"Rejecting pose outliers (pos>{OUTLIER_MAX_POS_JUMP_M*100:.0f}cm, rot>{OUTLIER_MAX_ROT_JUMP_DEG:.0f}°) …")
-    left_board_pose_seq  = reject_pose_outliers(left_board_pose_seq,  OUTLIER_MAX_POS_JUMP_M, OUTLIER_MAX_ROT_JUMP_DEG)
-    right_board_pose_seq = reject_pose_outliers(right_board_pose_seq, OUTLIER_MAX_POS_JUMP_M, OUTLIER_MAX_ROT_JUMP_DEG)
-    cube_pose_seq        = reject_pose_outliers(cube_pose_seq,        OUTLIER_MAX_POS_JUMP_M, OUTLIER_MAX_ROT_JUMP_DEG)
 
     # ── filter ────────────────────────────────────────────────────────────────
     def filter_pose_full(pose_seq, cutoff_hz):
@@ -390,8 +417,10 @@ def main():
     output = {
         "timeline":    np.array(timeline, dtype=float),
         "target_hz":        np.array([TARGET_HZ], dtype=float),
-        "filter_hz_poses":  np.array([FILTER_HZ_POSES if FILTER_HZ_POSES is not None else 0.0], dtype=float),
-        "filter_hz_hands":  np.array([FILTER_HZ_HANDS if FILTER_HZ_HANDS is not None else 0.0], dtype=float),
+        "filter_hz_poses":           np.array([FILTER_HZ_POSES if FILTER_HZ_POSES is not None else 0.0], dtype=float),
+        "filter_hz_hands":           np.array([FILTER_HZ_HANDS if FILTER_HZ_HANDS is not None else 0.0], dtype=float),
+        "outlier_max_pos_speed_m_s": np.array([OUTLIER_MAX_POS_SPEED_M_S], dtype=float),
+        "outlier_max_rot_speed_deg_s": np.array([OUTLIER_MAX_ROT_SPEED_DEG_S], dtype=float),
 
         "left_joints_wrist":  obj(left_joints_wrist_seq),
         "right_joints_wrist": obj(right_joints_wrist_seq),

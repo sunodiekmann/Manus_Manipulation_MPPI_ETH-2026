@@ -41,7 +41,7 @@ import numpy as np
 from loop_rate_limiters import RateLimiter
 from scipy.spatial.transform import Rotation as R
 
-from scripts.retargeting.tesollo_constants import DEFAULT_TARGET_OFFSETS, TARGET_SCALE
+from scripts.retargeting.tesollo_constants import FINGERS, DEFAULT_TARGET_OFFSETS, TARGET_SCALE
 from scripts.retargeting.tesollo_mujoco_utils import (
     initialize_fingertip_target_mocaps,
     set_hand_base_pose,
@@ -60,7 +60,10 @@ from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
 from scripts.utils.transforms import pose_to_matrix
 
 MODEL_PATH = "/home/suno/robohand2/assets/output_mocap.xml"
-IK_STEPS = 20
+IK_STEPS = 50
+# Zero offsets for offline retargeting: IK targets are placed directly at
+# human fingertip positions.  DEFAULT_TARGET_OFFSETS are kept for live teleop.
+OFFLINE_TARGET_OFFSETS = {f: np.zeros(3) for f in FINGERS}
 IK_DT = 0.002
 PLAYBACK_HZ = 30.0
 # Number of IK calls on the first valid frame before the main loop begins.
@@ -132,7 +135,7 @@ def _make_camera(model) -> mujoco.MjvCamera:
 
 # ── retargeting ───────────────────────────────────────────────────────────────
 
-def _ik_frame(model, mj_data, task_bundle, default_quats, fingertips, T_world_wrist, ergonomics, cube_pose):
+def _ik_frame(model, mj_data, task_bundle, default_quats, fingertips, T_world_wrist, ergonomics, cube_pose, scale=TARGET_SCALE):
     _set_cube_mocap(model, mj_data, cube_pose)
 
     has_targets = update_fingertip_targets_world_frame(
@@ -142,8 +145,8 @@ def _ik_frame(model, mj_data, task_bundle, default_quats, fingertips, T_world_wr
         fingertip_positions=fingertips,
         fingertip_quats=default_quats,
         T_world_from_wrist=T_world_wrist,
-        offsets=DEFAULT_TARGET_OFFSETS,
-        scale=TARGET_SCALE,
+        offsets=OFFLINE_TARGET_OFFSETS,
+        scale=scale,
     )
 
     if has_targets:
@@ -165,8 +168,8 @@ def _ik_frame(model, mj_data, task_bundle, default_quats, fingertips, T_world_wr
     return task_bundle.configuration.q.copy()
 
 
-def retarget_offline(session_dir: Path, show_viewer: bool = False, force: bool = False):
-    output_path = session_dir / "retargeted_sequence_baseline.npz"
+def retarget_offline(session_dir: Path, show_viewer: bool = False, force: bool = False, scale: float = TARGET_SCALE, output_name: str = "retargeted_sequence_baseline.npz"):
+    output_path = session_dir / output_name
     if output_path.exists() and not force:
         print(f"  [skip] {output_path.name} already exists (--force to overwrite)")
         return
@@ -203,10 +206,10 @@ def retarget_offline(session_dir: Path, show_viewer: bool = False, force: bool =
         _ik_frame(
             model, mj_data, task_bundle, default_quats,
             right_fingertips_wrist[first_i], right_wrist_world[first_i],
-            right_ergonomics[first_i], cube_pose_world[first_i],
+            right_ergonomics[first_i], cube_pose_world[first_i], scale=scale,
         )
 
-    print(f"  Retargeting {N} frames  ({IK_STEPS} IK steps/frame) …")
+    print(f"  Retargeting {N} frames  ({IK_STEPS} IK steps/frame, scale={scale:.2f}) …")
 
     if show_viewer:
         with mujoco.viewer.launch_passive(
@@ -220,7 +223,7 @@ def retarget_offline(session_dir: Path, show_viewer: bool = False, force: bool =
                 retargeted_qpos[i] = _ik_frame(
                     model, mj_data, task_bundle, default_quats,
                     right_fingertips_wrist[i], right_wrist_world[i],
-                    right_ergonomics[i], cube_pose_world[i],
+                    right_ergonomics[i], cube_pose_world[i], scale=scale,
                 )
                 mujoco.mj_camlight(model, mj_data)
                 viewer.sync()
@@ -232,7 +235,7 @@ def retarget_offline(session_dir: Path, show_viewer: bool = False, force: bool =
             retargeted_qpos[i] = _ik_frame(
                 model, mj_data, task_bundle, default_quats,
                 right_fingertips_wrist[i], right_wrist_world[i],
-                right_ergonomics[i], cube_pose_world[i],
+                right_ergonomics[i], cube_pose_world[i], scale=scale,
             )
             if (i + 1) % 200 == 0:
                 print(f"    [{i + 1}/{N}]")
@@ -309,6 +312,8 @@ def _render_video(session_dir, model, data, timeline, retargeted_qpos, cube_pose
     video_fps = max(1, round(1.0 / dt_mean))
 
     video_path = session_dir / "retargeted_sequence_baseline.mp4"
+    model.vis.global_.offwidth = VIDEO_WIDTH
+    model.vis.global_.offheight = VIDEO_HEIGHT
     renderer = mujoco.Renderer(model, height=VIDEO_HEIGHT, width=VIDEO_WIDTH)
     cam = _make_camera(model)
 
