@@ -63,6 +63,11 @@ MODEL_PATH = "/home/suno/robohand2/assets/output_mocap.xml"
 IK_STEPS = 20
 IK_DT = 0.002
 PLAYBACK_HZ = 30.0
+# Number of IK calls on the first valid frame before the main loop begins.
+# The IK starts from the default zero configuration which can be far from the
+# first tracked pose; this warm-up drives it to convergence so frame 0 in the
+# saved output is already a good solution rather than a transient spike.
+WARMUP_CALLS = 30  # × IK_STEPS = 600 total solver steps
 
 # Video rendering resolution
 VIDEO_HEIGHT = 720
@@ -185,6 +190,21 @@ def retarget_offline(session_dir: Path, show_viewer: bool = False, force: bool =
 
     default_quats = _default_quats(len(task_bundle.fingers))
     retargeted_qpos = np.full((N, model.nq), np.nan)
+
+    # Warm up on the first valid frame so the IK is already converged before
+    # the main loop starts — avoids a large spike at frame 0.
+    first_i = next(
+        (i for i in range(N)
+         if right_fingertips_wrist[i] is not None and right_wrist_world[i] is not None),
+        0,
+    )
+    print(f"  Warming up on frame {first_i} ({WARMUP_CALLS} × {IK_STEPS} IK steps) …")
+    for _ in range(WARMUP_CALLS):
+        _ik_frame(
+            model, mj_data, task_bundle, default_quats,
+            right_fingertips_wrist[first_i], right_wrist_world[first_i],
+            right_ergonomics[first_i], cube_pose_world[first_i],
+        )
 
     print(f"  Retargeting {N} frames  ({IK_STEPS} IK steps/frame) …")
 
