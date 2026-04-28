@@ -1,5 +1,6 @@
 import numpy as np
 import mink
+from scipy.spatial.transform import Rotation as R
 
 from scripts.retargeting.tesollo_target_mapping import (
     map_wrist_frame_target,
@@ -134,14 +135,29 @@ def reset_relative_finger_targets(task_bundle):
         task.set_target(mink.SE3.identity())
 
 
-def update_posture_target_from_joint_angles(task_bundle, angles, qpos_start_index=7):
+def update_posture_target_from_joint_angles(task_bundle, angles, T_world_robot_base=None, qpos_start_index=7):
+    """Set the posture target to (robot_base_pose | finger_angles).
+
+    If T_world_robot_base is omitted, the freejoint target falls back to the
+    world-origin identity pose (legacy behaviour). Passing the actual base pose
+    keeps the posture task from dragging the freejoint toward the world origin
+    over the IK iterations.
+    """
     if angles is None:
         return
 
-    # Build full qpos: wrist fixed at origin (identity free joint) + finger angles
     nq = task_bundle.configuration.model.nq
     target_q = np.zeros(nq)
-    target_q[3] = 1.0  # quaternion w=1 for identity orientation
+    if T_world_robot_base is not None:
+        T = np.asarray(T_world_robot_base, dtype=float)
+        target_q[0:3] = T[:3, 3]
+        quat_xyzw = R.from_matrix(T[:3, :3]).as_quat()
+        target_q[3] = quat_xyzw[3]   # qw
+        target_q[4] = quat_xyzw[0]   # qx
+        target_q[5] = quat_xyzw[1]   # qy
+        target_q[6] = quat_xyzw[2]   # qz
+    else:
+        target_q[3] = 1.0
     target_q[qpos_start_index:qpos_start_index + len(angles)] = angles
     task_bundle.posture_task.set_target(target_q)
 

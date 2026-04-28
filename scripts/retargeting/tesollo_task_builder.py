@@ -28,10 +28,10 @@ def build_tesollo_task_bundle(
     posture_cost: float = 5e-2,
     fingertip_position_cost: float = 1.0,
     fingertip_orientation_cost: float = 0.01,
-    fingertip_lm_damping: float = 1.0,
-    relative_position_cost: float = 1.0,
+    fingertip_lm_damping: float = 0.1,        # was 1.0 — lower → frame task more responsive
+    relative_position_cost: float = 0.3,      # was 1.0 — was dominating frame tasks (10 pairs vs 5 fingers)
     relative_orientation_cost: float = 0.0,
-    relative_lm_damping: float = 0.1,
+    relative_lm_damping: float = 1.0,         # was 0.1 — higher → relative task more compliant (regularizer)
     use_collision_avoidance: bool = False,
 ) -> TesolloTaskBundle:
     configuration = mink.Configuration(model)

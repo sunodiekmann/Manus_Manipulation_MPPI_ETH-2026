@@ -78,6 +78,18 @@ VIDEO_WIDTH = 1280
 
 _IDENTITY_QUAT_XYZW = np.array([0.0, 0.0, 0.0, 1.0])
 
+# Wrist→robot-base translational offset, expressed in wrist frame (metres).
+DEFAULT_WRIST_OFFSET = np.zeros(3, dtype=float)
+
+
+def _apply_wrist_offset(T_world_wrist, offset):
+    """Translate the wrist transform by `offset` expressed in the wrist frame."""
+    if T_world_wrist is None:
+        return None
+    T = np.asarray(T_world_wrist, dtype=float).copy()
+    T[:3, 3] = T[:3, :3] @ np.asarray(offset, dtype=float) + T[:3, 3]
+    return T
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -135,9 +147,22 @@ def _make_camera(model) -> mujoco.MjvCamera:
 
 # ── retargeting ───────────────────────────────────────────────────────────────
 
-def _ik_frame(model, mj_data, task_bundle, default_quats, fingertips, T_world_wrist, ergonomics, cube_pose, scale=TARGET_SCALE):
+def _ik_frame(model, mj_data, task_bundle, default_quats, fingertips, T_world_wrist,
+              ergonomics, cube_pose, scale=TARGET_SCALE,
+              wrist_offset=DEFAULT_WRIST_OFFSET):
+    """One frame of world-frame IK.
+
+    Targets are computed from the Manus wrist transform; the robot freejoint is
+    placed at `T_world_wrist @ T_offset` (translational only) so the robot base
+    can be anatomically calibrated against the Manus wrist landmark.
+    """
+    T_world_robot_base = _apply_wrist_offset(T_world_wrist, wrist_offset)
+
     _set_cube_mocap(model, mj_data, cube_pose)
 
+    # Targets are anchored to the *Manus* wrist (where the human fingertip
+    # positions are expressed); the robot base offset only repositions the IK
+    # root, not the targets.
     has_targets = update_fingertip_targets_world_frame(
         model=model,
         data=mj_data,
@@ -154,25 +179,30 @@ def _ik_frame(model, mj_data, task_bundle, default_quats, fingertips, T_world_wr
     else:
         reset_relative_finger_targets(task_bundle)
 
-    update_posture_target_from_joint_angles(task_bundle, ergonomics)
+    update_posture_target_from_joint_angles(task_bundle, ergonomics, T_world_robot_base)
     update_finger_frame_tasks_from_mocaps(model, mj_data, task_bundle)
 
     for _ in range(IK_STEPS):
         solve_ik_step(task_bundle, dt=IK_DT)
+        if T_world_robot_base is not None:
+            _pin_wrist_in_configuration(task_bundle, T_world_robot_base)
 
-    if T_world_wrist is not None:
-        T = np.asarray(T_world_wrist, dtype=float)
-        set_hand_base_pose(model, mj_data, T)
-        _pin_wrist_in_configuration(task_bundle, T)
+    if T_world_robot_base is not None:
+        set_hand_base_pose(model, mj_data, T_world_robot_base)
 
     return task_bundle.configuration.q.copy()
 
 
-def retarget_offline(session_dir: Path, show_viewer: bool = False, force: bool = False, scale: float = TARGET_SCALE, output_name: str = "retargeted_sequence_baseline.npz"):
+def retarget_offline(session_dir: Path, show_viewer: bool = False, force: bool = False,
+                     scale: float = TARGET_SCALE,
+                     output_name: str = "retargeted_sequence_baseline.npz",
+                     wrist_offset=DEFAULT_WRIST_OFFSET):
     output_path = session_dir / output_name
     if output_path.exists() and not force:
         print(f"  [skip] {output_path.name} already exists (--force to overwrite)")
         return
+
+    wrist_offset = np.asarray(wrist_offset, dtype=float)
 
     npz = _load_processed(session_dir)
     timeline = np.asarray(npz["timeline"], dtype=float)
@@ -201,12 +231,14 @@ def retarget_offline(session_dir: Path, show_viewer: bool = False, force: bool =
          if right_fingertips_wrist[i] is not None and right_wrist_world[i] is not None),
         0,
     )
-    print(f"  Warming up on frame {first_i} ({WARMUP_CALLS} × {IK_STEPS} IK steps) …")
+    print(f"  Warming up on frame {first_i} ({WARMUP_CALLS} × {IK_STEPS} IK steps)"
+          f"   wrist_offset={wrist_offset.tolist()}")
     for _ in range(WARMUP_CALLS):
         _ik_frame(
             model, mj_data, task_bundle, default_quats,
             right_fingertips_wrist[first_i], right_wrist_world[first_i],
             right_ergonomics[first_i], cube_pose_world[first_i], scale=scale,
+            wrist_offset=wrist_offset,
         )
 
     print(f"  Retargeting {N} frames  ({IK_STEPS} IK steps/frame, scale={scale:.2f}) …")
@@ -224,6 +256,7 @@ def retarget_offline(session_dir: Path, show_viewer: bool = False, force: bool =
                     model, mj_data, task_bundle, default_quats,
                     right_fingertips_wrist[i], right_wrist_world[i],
                     right_ergonomics[i], cube_pose_world[i], scale=scale,
+                    wrist_offset=wrist_offset,
                 )
                 mujoco.mj_camlight(model, mj_data)
                 viewer.sync()
@@ -236,11 +269,17 @@ def retarget_offline(session_dir: Path, show_viewer: bool = False, force: bool =
                 model, mj_data, task_bundle, default_quats,
                 right_fingertips_wrist[i], right_wrist_world[i],
                 right_ergonomics[i], cube_pose_world[i], scale=scale,
+                wrist_offset=wrist_offset,
             )
             if (i + 1) % 200 == 0:
                 print(f"    [{i + 1}/{N}]")
 
-    np.savez_compressed(output_path, timeline=timeline, retargeted_qpos=retargeted_qpos)
+    np.savez_compressed(
+        output_path,
+        timeline=timeline,
+        retargeted_qpos=retargeted_qpos,
+        wrist_offset=wrist_offset,
+    )
     print(f"  Saved: {output_path}")
 
 
@@ -262,6 +301,29 @@ def _load_cube_poses(session_dir: Path, N: int):
     return np.array([None] * N, dtype=object)
 
 
+def _load_target_inputs(session_dir: Path):
+    """Load wrist transforms + wrist-frame fingertip positions for visualizing targets."""
+    for name in ("processed_sequence_with_proxy.npz", "processed_sequence.npz"):
+        p = session_dir / name
+        if p.exists():
+            d = np.load(p, allow_pickle=True)
+            return d.get("right_wrist_world"), d.get("right_fingertips_wrist")
+    return None, None
+
+
+def _update_target_mocaps(model, data, T_world_wrist, fingertips_wrist, scale=TARGET_SCALE):
+    """Update {finger}_target mocap bodies with world-frame fingertip targets."""
+    if T_world_wrist is None or fingertips_wrist is None:
+        return
+    R_ww = T_world_wrist[:3, :3]
+    t_ww = T_world_wrist[:3, 3]
+    for i, finger in enumerate(FINGERS):
+        pos_wrist = np.asarray(fingertips_wrist[i], dtype=float) * scale + OFFLINE_TARGET_OFFSETS[finger]
+        pos_world = R_ww @ pos_wrist + t_ww
+        mocap_id = model.body(f"{finger}_target").mocapid[0]
+        data.mocap_pos[mocap_id] = pos_world
+
+
 def replay_sequence(session_dir: Path, save_video: bool = False):
     npz = _load_retargeted(session_dir)
     timeline = np.asarray(npz["timeline"], dtype=float)
@@ -269,17 +331,21 @@ def replay_sequence(session_dir: Path, save_video: bool = False):
     N = len(timeline)
 
     cube_pose_world = _load_cube_poses(session_dir, N)
+    wrist_world, fingertips_wrist = _load_target_inputs(session_dir)
 
     model = mujoco.MjModel.from_xml_path(MODEL_PATH)
     data = mujoco.MjData(model)
 
     if save_video:
-        _render_video(session_dir, model, data, timeline, retargeted_qpos, cube_pose_world)
+        _render_video(session_dir, model, data, timeline, retargeted_qpos,
+                      cube_pose_world, wrist_world, fingertips_wrist)
     else:
-        _replay_viewer(model, data, timeline, retargeted_qpos, cube_pose_world)
+        _replay_viewer(model, data, timeline, retargeted_qpos, cube_pose_world,
+                       wrist_world, fingertips_wrist)
 
 
-def _replay_viewer(model, data, timeline, retargeted_qpos, cube_pose_world):
+def _replay_viewer(model, data, timeline, retargeted_qpos, cube_pose_world,
+                   wrist_world=None, fingertips_wrist=None):
     N = len(timeline)
     dt_mean = float(np.diff(timeline).mean()) if N > 1 else 1.0 / PLAYBACK_HZ
     fps = min(1.0 / dt_mean, PLAYBACK_HZ)
@@ -295,12 +361,19 @@ def _replay_viewer(model, data, timeline, retargeted_qpos, cube_pose_world):
                 if not viewer.is_running():
                     break
                 _apply_qpos(model, data, retargeted_qpos[i], cube_pose_world[i])
+                if (wrist_world is not None and fingertips_wrist is not None
+                        and wrist_world[i] is not None):
+                    _update_target_mocaps(model, data,
+                                          np.asarray(wrist_world[i], dtype=float),
+                                          fingertips_wrist[i])
+                    mujoco.mj_forward(model, data)
                 mujoco.mj_camlight(model, data)
                 viewer.sync()
                 rate.sleep()
 
 
-def _render_video(session_dir, model, data, timeline, retargeted_qpos, cube_pose_world):
+def _render_video(session_dir, model, data, timeline, retargeted_qpos, cube_pose_world,
+                  wrist_world=None, fingertips_wrist=None):
     try:
         import imageio
     except ImportError:
@@ -321,6 +394,12 @@ def _render_video(session_dir, model, data, timeline, retargeted_qpos, cube_pose
     with imageio.get_writer(str(video_path), fps=video_fps) as writer:
         for i in range(N):
             _apply_qpos(model, data, retargeted_qpos[i], cube_pose_world[i])
+            if (wrist_world is not None and fingertips_wrist is not None
+                    and wrist_world[i] is not None):
+                _update_target_mocaps(model, data,
+                                      np.asarray(wrist_world[i], dtype=float),
+                                      fingertips_wrist[i])
+                mujoco.mj_forward(model, data)
             renderer.update_scene(data, camera=cam)
             writer.append_data(renderer.render())
             if (i + 1) % 200 == 0:
@@ -332,18 +411,33 @@ def _render_video(session_dir, model, data, timeline, retargeted_qpos, cube_pose
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+def _parse_offset(args):
+    """Parse `--offset tx ty tz` from CLI args list (modifies in place)."""
+    if "--offset" in args:
+        i = args.index("--offset")
+        try:
+            tx, ty, tz = float(args[i+1]), float(args[i+2]), float(args[i+3])
+        except (IndexError, ValueError):
+            print("Error: --offset requires three floats: --offset tx ty tz")
+            sys.exit(1)
+        del args[i:i+4]
+        return np.array([tx, ty, tz], dtype=float)
+    return DEFAULT_WRIST_OFFSET
+
+
 def main():
     args = sys.argv[1:]
     show_viewer = "--viewer" in args
     do_replay   = "--replay" in args
     save_video  = "--save-video" in args
     force       = "--force" in args
+    wrist_offset = _parse_offset(args)
     paths = [Path(a) for a in args if not a.startswith("--")]
 
     if not paths:
         print(
             "Usage: python -m scripts.retargeting.retarget_sequence_baseline <session_dir>"
-            " [--viewer] [--replay] [--save-video] [--force]"
+            " [--viewer] [--replay] [--save-video] [--force] [--offset tx ty tz]"
         )
         sys.exit(1)
 
@@ -352,15 +446,18 @@ def main():
         if do_replay:
             replay_sequence(p, save_video=save_video)
         else:
-            retarget_offline(p, show_viewer=show_viewer, force=force)
+            retarget_offline(p, show_viewer=show_viewer, force=force,
+                             wrist_offset=wrist_offset)
             if save_video:
                 npz = _load_retargeted(p)
                 timeline = np.asarray(npz["timeline"], dtype=float)
                 retargeted_qpos = npz["retargeted_qpos"]
                 cube_pose_world = _load_cube_poses(p, len(timeline))
+                wrist_world, fingertips_wrist = _load_target_inputs(p)
                 model = mujoco.MjModel.from_xml_path(MODEL_PATH)
                 data = mujoco.MjData(model)
-                _render_video(p, model, data, timeline, retargeted_qpos, cube_pose_world)
+                _render_video(p, model, data, timeline, retargeted_qpos,
+                              cube_pose_world, wrist_world, fingertips_wrist)
 
 
 if __name__ == "__main__":

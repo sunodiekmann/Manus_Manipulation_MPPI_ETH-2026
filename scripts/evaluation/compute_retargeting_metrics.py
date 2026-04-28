@@ -40,7 +40,7 @@ FINGER_GEOMS = [f"{f}_tip" for f in FINGERS]
 # ── data loading ──────────────────────────────────────────────────────────────
 
 def load_session(session_dir: Path):
-    retargeted_path = session_dir / "retargeted_sequence_baseline.npz"
+    retargeted_path = session_dir / "retargeted_sequence_cube_relative.npz"
     proxy_path      = session_dir / "processed_sequence_with_proxy.npz"
 
     if not retargeted_path.exists():

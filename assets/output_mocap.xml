@@ -3,7 +3,7 @@
   <option cone="elliptic" impratio="10"/>
 
   <default>
-    <joint axis="0 1 0" damping=".1"/>
+    <joint axis="0 1 0" damping="0.2" armature="0.00149376" actuatorfrcrange="-0.2196 0.2196" frictionloss="0.02"/>
 
     <default class="visual">
       <geom type="mesh" contype="0" conaffinity="0" group="2"/>
@@ -275,6 +275,7 @@
   </contact>
 
   <actuator>
+  
     <position kp="1" name="rj_dg_1_1_a" joint="rj_dg_1_1" ctrlrange="-0.383972 0.890118"/>
     <position kp="1" name="rj_dg_1_2_a" joint="rj_dg_1_2" ctrlrange="-3.14159 0"/>
     <position kp="1" name="rj_dg_1_3_a" joint="rj_dg_1_3" ctrlrange="-0.1 1.5708"/>
