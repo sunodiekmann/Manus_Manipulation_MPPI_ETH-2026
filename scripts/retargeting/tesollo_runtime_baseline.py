@@ -4,6 +4,7 @@ import mink
 from scripts.retargeting.tesollo_target_mapping import (
     map_wrist_frame_target,
     map_world_frame_target,
+    map_cube_frame_target,
 )
 from scripts.retargeting.tesollo_mujoco_utils import set_mocap_body_pose
 
@@ -61,6 +62,42 @@ def update_fingertip_targets_world_frame(
             fingertip_positions[i],
             fingertip_quats[i],
             finger,
+            T_world_from_wrist,
+            offsets=offsets,
+            scale=scale,
+        )
+        set_mocap_body_pose(
+            model,
+            data,
+            f"{finger}_target",
+            pos_target,
+            q_target.as_quat(),
+        )
+
+    return True
+
+
+def update_fingertip_targets_cube_frame(
+    model,
+    data,
+    task_bundle,
+    fingertip_positions_cube,
+    fingertip_quats,
+    T_world_from_cube,
+    T_world_from_wrist,
+    offsets=None,
+    scale=1.0,
+):
+    if (fingertip_positions_cube is None or fingertip_quats is None
+            or T_world_from_cube is None or T_world_from_wrist is None):
+        return False
+
+    for i, finger in enumerate(task_bundle.fingers):
+        pos_target, q_target = map_cube_frame_target(
+            fingertip_positions_cube[i],
+            fingertip_quats[i],
+            finger,
+            T_world_from_cube,
             T_world_from_wrist,
             offsets=offsets,
             scale=scale,

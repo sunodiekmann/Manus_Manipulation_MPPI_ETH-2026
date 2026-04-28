@@ -37,6 +37,41 @@ def map_wrist_frame_target(pos_wrist, quat_wrist_xyzw, finger: str, offsets=None
     return pos_target, q_target
 
 
+def map_cube_frame_target(
+    pos_cube,
+    quat_wrist_xyzw,
+    finger: str,
+    T_world_from_cube,
+    T_world_from_wrist,
+    offsets=None,
+    scale: float = TARGET_SCALE,
+):
+    """Map a fingertip position expressed in cube frame to a world-frame IK target.
+
+    Position is derived from cube-frame coordinates so targets track the cube
+    regardless of wrist-tracking noise.  Orientation is derived from the wrist
+    frame (same convention as map_world_frame_target) so the IK sees the same
+    orientation cost landscape as the baseline and converges to the same local
+    minimum.
+    """
+    if offsets is None:
+        offsets = DEFAULT_TARGET_OFFSETS
+
+    pos_cube_adjusted = np.asarray(pos_cube, dtype=float) * scale + offsets[finger]
+
+    R_world_cube = T_world_from_cube[:3, :3]
+    t_world_cube = T_world_from_cube[:3, 3]
+    pos_world = R_world_cube @ pos_cube_adjusted + t_world_cube
+
+    # Use wrist rotation for orientation — keeps the same target quat as the
+    # world-frame baseline so the IK converges to the same local minimum.
+    R_world_wrist = T_world_from_wrist[:3, :3]
+    q_local = rotate_local_fingertip_quaternion(quat_wrist_xyzw, finger)
+    q_world = R.from_matrix(R_world_wrist) * q_local
+
+    return pos_world, q_world
+
+
 def map_world_frame_target(
     pos_wrist,
     quat_wrist_xyzw,
