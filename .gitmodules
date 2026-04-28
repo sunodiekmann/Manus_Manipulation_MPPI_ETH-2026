@@ -19,3 +19,6 @@
 [submodule "src/dexmachina"]
 	path = src/dexmachina
 	url = https://github.com/MandiZhao/dexmachina.git
+[submodule "/home/suno/robohand2/src/spider"]
+	path = /home/suno/robohand2/src/spider
+	url = https://github.com/facebookresearch/spider.git
