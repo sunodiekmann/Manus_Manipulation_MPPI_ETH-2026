@@ -85,9 +85,22 @@ def rollout_session(session_dir: Path, retargeted_name: str, model, data):
 
     retargeted_qpos = ret["retargeted_qpos"]           # (N, 27)
     cube_pose_ref = proc["cube_pose_world"]             # (N, 7) [x,y,z,qw,qx,qy,qz]
-    wrist_world = proc["right_wrist_world"]             # (N, 4, 4)
 
+    # Wrist comes from the retargeted qpos (the IK-determined pose) rather than
+    # the raw Manus tracking — accounts for the soft wrist task, so the physics
+    # rollout starts where the kinematic reference actually placed the hand.
     N = len(retargeted_qpos)
+    wrist_world = np.empty(N, dtype=object)
+    for i in range(N):
+        if np.any(np.isnan(retargeted_qpos[i])):
+            wrist_world[i] = None
+            continue
+        T = np.eye(4)
+        T[:3, 3] = retargeted_qpos[i, 0:3]
+        # qpos quat order is [qw, qx, qy, qz]
+        qw, qx, qy, qz = retargeted_qpos[i, 3:7]
+        T[:3, :3] = R.from_quat([qx, qy, qz, qw]).as_matrix()
+        wrist_world[i] = T
 
     # Find the cube freejoint qpos address in the physics model
     cube_qposadr = int(model.joint("cube_freejoint").qposadr[0])

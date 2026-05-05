@@ -16,6 +16,7 @@ class TesolloTaskBundle:
     posture_task: mink.PostureTask
     finger_tasks: list
     relative_finger_tasks: list
+    wrist_task: mink.FrameTask
     tasks: list
     limits: list
     fingers: list
@@ -25,13 +26,16 @@ class TesolloTaskBundle:
 
 def build_tesollo_task_bundle(
     model,
-    posture_cost: float = 5e-2,
-    fingertip_position_cost: float = 1.0,
-    fingertip_orientation_cost: float = 0.01,
-    fingertip_lm_damping: float = 0.1,        # was 1.0 — lower → frame task more responsive
-    relative_position_cost: float = 0.3,      # was 1.0 — was dominating frame tasks (10 pairs vs 5 fingers)
+    posture_cost: float = 1e-3,                # tiny — singularity regularizer only
+    fingertip_position_cost: float = 100.0,    # dominant — drives fingertips to targets
+    fingertip_orientation_cost: float = 0.5,
+    fingertip_lm_damping: float = 0.1,
+    relative_position_cost: float = 0.3,
     relative_orientation_cost: float = 0.0,
-    relative_lm_damping: float = 1.0,         # was 0.1 — higher → relative task more compliant (regularizer)
+    relative_lm_damping: float = 1.0,
+    wrist_position_cost: float = 0.0,            # unused: position is hard-pinned each IK step
+    wrist_orientation_cost: float = 40.0,
+    wrist_lm_damping: float = 0.5,
     use_collision_avoidance: bool = False,
 ) -> TesolloTaskBundle:
     configuration = mink.Configuration(model)
@@ -62,6 +66,16 @@ def build_tesollo_task_bundle(
         )
         relative_finger_tasks.append(task)
 
+    # Soft wrist pin: target set per frame to the tracked wrist (+ offset).
+    # IK can deviate from this by mm/degrees if it helps reach fingertip targets.
+    wrist_task = mink.FrameTask(
+        frame_name="rh",
+        frame_type="body",
+        position_cost=wrist_position_cost,
+        orientation_cost=wrist_orientation_cost,
+        lm_damping=wrist_lm_damping,
+    )
+
     limits = [mink.ConfigurationLimit(model=model)]
     if use_collision_avoidance:
         limits.append(
@@ -73,6 +87,7 @@ def build_tesollo_task_bundle(
 
     tasks = [
         posture_task,
+        wrist_task,
         *finger_tasks,
         *relative_finger_tasks,
     ]
@@ -82,6 +97,7 @@ def build_tesollo_task_bundle(
         posture_task=posture_task,
         finger_tasks=finger_tasks,
         relative_finger_tasks=relative_finger_tasks,
+        wrist_task=wrist_task,
         tasks=tasks,
         limits=limits,
         fingers=FINGERS,

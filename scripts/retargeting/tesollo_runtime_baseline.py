@@ -12,6 +12,11 @@ from scripts.retargeting.tesollo_mujoco_utils import set_mocap_body_pose
 
 def initialize_targets_from_configuration(task_bundle: object):
     task_bundle.posture_task.set_target_from_configuration(task_bundle.configuration)
+    # Initialize wrist task from current config so it has a valid target before
+    # update_wrist_task_target is first called (prevents segfault in teleop scripts).
+    task_bundle.wrist_task.set_target(
+        task_bundle.configuration.get_transform_frame_to_world("rh", "body")
+    )
 
 
 def update_fingertip_targets_wrist_frame(
@@ -176,6 +181,15 @@ def update_finger_frame_tasks_from_mocaps(model, data, task_bundle):
         task.set_target(
             mink.SE3.from_mocap_name(model, data, f"{finger}_target")
         )
+
+
+def update_wrist_task_target(task_bundle, T_world_robot_base):
+    """Set the wrist FrameTask target to the desired robot-base pose (4x4)."""
+    if T_world_robot_base is None:
+        return
+    task_bundle.wrist_task.set_target(
+        mink.SE3.from_matrix(np.asarray(T_world_robot_base, dtype=float))
+    )
 
 
 def solve_ik_step(task_bundle, dt: float, damping: float = 1e-5):

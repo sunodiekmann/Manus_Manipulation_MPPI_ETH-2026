@@ -55,6 +55,7 @@ from scripts.retargeting.tesollo_runtime_baseline import (
     update_fingertip_targets_world_frame,
     update_posture_target_from_joint_angles,
     update_relative_finger_targets,
+    update_wrist_task_target,
 )
 from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
 from scripts.utils.transforms import pose_to_matrix
@@ -181,14 +182,18 @@ def _ik_frame(model, mj_data, task_bundle, default_quats, fingertips, T_world_wr
 
     update_posture_target_from_joint_angles(task_bundle, ergonomics, T_world_robot_base)
     update_finger_frame_tasks_from_mocaps(model, mj_data, task_bundle)
+    update_wrist_task_target(task_bundle, T_world_robot_base)
 
     for _ in range(IK_STEPS):
         solve_ik_step(task_bundle, dt=IK_DT)
+        # Hard-pin wrist translation; orientation stays soft via wrist task.
         if T_world_robot_base is not None:
-            _pin_wrist_in_configuration(task_bundle, T_world_robot_base)
+            pos = np.asarray(T_world_robot_base, dtype=float)[:3, 3]
+            task_bundle.configuration.q[0:3] = pos
+            task_bundle.configuration.data.qpos[0:3] = pos
 
-    if T_world_robot_base is not None:
-        set_hand_base_pose(model, mj_data, T_world_robot_base)
+    mj_data.qpos[: task_bundle.configuration.q.shape[0]] = task_bundle.configuration.q
+    mujoco.mj_forward(model, mj_data)
 
     return task_bundle.configuration.q.copy()
 

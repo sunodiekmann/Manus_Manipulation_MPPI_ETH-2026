@@ -52,6 +52,7 @@ from scripts.retargeting.tesollo_runtime_baseline import (
     update_fingertip_targets_cube_frame,
     update_posture_target_from_joint_angles,
     update_relative_finger_targets,
+    update_wrist_task_target,
 )
 from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
 from scripts.utils.transforms import pose_to_matrix
@@ -75,6 +76,12 @@ _IDENTITY_QUAT_XYZW = np.array([0.0, 0.0, 0.0, 1.0])
 # freejoint origin. Override via `wrist_offset` arg or `--offset tx ty tz`.
 DEFAULT_WRIST_OFFSET = np.zeros(3, dtype=float)
 
+# Target-shift: translates the *cube* (and therefore all cube-relative fingertip
+# targets) by this vector — expressed in wrist frame, in metres. Used to push
+# the targets away from the palm so the robot's longer fingers don't have to
+# curl as tightly. Wrist stays fixed; relative geometry preserved.
+DEFAULT_TARGET_SHIFT = np.zeros(3, dtype=float)
+
 
 def _apply_wrist_offset(T_world_wrist, offset):
     """Translate the wrist transform by `offset` expressed in the wrist frame."""
@@ -83,6 +90,19 @@ def _apply_wrist_offset(T_world_wrist, offset):
     T = np.asarray(T_world_wrist, dtype=float).copy()
     T[:3, 3] = T[:3, :3] @ np.asarray(offset, dtype=float) + T[:3, 3]
     return T
+
+
+def _shift_cube_pose(cube_pose7, T_world_wrist, shift):
+    """Translate cube pose by `shift` expressed in wrist frame.
+
+    cube_pose7 is [x,y,z, qw,qx,qy,qz]. Returns shifted pose, same format.
+    """
+    if cube_pose7 is None or T_world_wrist is None:
+        return cube_pose7
+    cp = np.asarray(cube_pose7, dtype=float).copy()
+    shift_world = np.asarray(T_world_wrist, dtype=float)[:3, :3] @ np.asarray(shift, dtype=float)
+    cp[:3] = cp[:3] + shift_world
+    return cp
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -111,6 +131,15 @@ def _pin_wrist_in_configuration(task_bundle, T_world_wrist):
     q[4] = rot_xyzw[0]
     q[5] = rot_xyzw[1]
     q[6] = rot_xyzw[2]
+
+
+def _pin_wrist_position_only(task_bundle, T_world_wrist):
+    """Hard-pin the freejoint translation to T_world_wrist; leave quaternion free."""
+    if T_world_wrist is None:
+        return
+    pos = np.asarray(T_world_wrist, dtype=float)[:3, 3]
+    task_bundle.configuration.q[0:3] = pos
+    task_bundle.configuration.data.qpos[0:3] = pos
 
 
 def _set_cube_mocap(model, data, cube_pose):
@@ -178,14 +207,18 @@ def _ik_frame(
 
     update_posture_target_from_joint_angles(task_bundle, ergonomics, T_world_robot_base)
     update_finger_frame_tasks_from_mocaps(model, mj_data, task_bundle)
+    update_wrist_task_target(task_bundle, T_world_robot_base)
 
     for _ in range(IK_STEPS):
         solve_ik_step(task_bundle, dt=IK_DT)
-        if T_world_robot_base is not None:
-            _pin_wrist_in_configuration(task_bundle, T_world_robot_base)
+        # Hard-pin wrist translation; orientation stays free (controlled by wrist task).
+        # Mirrors the real robot's wrist DOFs (3 rotational, no translation).
+        _pin_wrist_position_only(task_bundle, T_world_robot_base)
 
-    if T_world_robot_base is not None:
-        set_hand_base_pose(model, mj_data, T_world_robot_base)
+    # Sync mj_data.qpos with the IK-determined configuration so downstream
+    # FK / mocap reads see the result.
+    mj_data.qpos[: task_bundle.configuration.q.shape[0]] = task_bundle.configuration.q
+    mujoco.mj_forward(model, mj_data)
 
     return task_bundle.configuration.q.copy()
 
@@ -206,6 +239,7 @@ def retarget_offline(
     force: bool = False,
     output_name: str = "retargeted_sequence_cube_relative.npz",
     wrist_offset=DEFAULT_WRIST_OFFSET,
+    target_shift=DEFAULT_TARGET_SHIFT,
 ):
     output_path = session_dir / output_name
     if output_path.exists() and not force:
@@ -213,6 +247,7 @@ def retarget_offline(
         return
 
     wrist_offset = np.asarray(wrist_offset, dtype=float)
+    target_shift = np.asarray(target_shift, dtype=float)
 
     npz = _load_processed(session_dir)
     timeline = np.asarray(npz["timeline"], dtype=float)
@@ -223,11 +258,22 @@ def retarget_offline(
     right_wrist_world     = npz["right_wrist_world"]
     right_ergonomics      = npz["right_ergonomics"]
 
-    # Build T_world_cube matrices from pose vectors
+    # Apply target shift in wrist frame: cube + all cube-relative targets move
+    # together by R_world_wrist @ target_shift. Wrist itself stays fixed.
+    if np.any(target_shift != 0.0):
+        cube_pose_used = np.empty(N, dtype=object)
+        for i in range(N):
+            cube_pose_used[i] = _shift_cube_pose(
+                cube_pose_world[i], right_wrist_world[i], target_shift,
+            )
+    else:
+        cube_pose_used = cube_pose_world
+
+    # Build T_world_cube matrices from (possibly shifted) pose vectors
     T_world_cube_arr = np.empty(N, dtype=object)
     for i in range(N):
-        if cube_pose_world[i] is not None:
-            T_world_cube_arr[i] = pose_to_matrix(np.asarray(cube_pose_world[i], dtype=float))
+        if cube_pose_used[i] is not None:
+            T_world_cube_arr[i] = pose_to_matrix(np.asarray(cube_pose_used[i], dtype=float))
 
     model = mujoco.MjModel.from_xml_path(MODEL_PATH)
     task_bundle = build_tesollo_task_bundle(model)
@@ -292,11 +338,19 @@ def retarget_offline(
             if (i + 1) % 200 == 0:
                 print(f"    [{i + 1}/{N}]")
 
+    # Stack the (possibly shifted) cube poses we actually targeted
+    cube_pose_used_arr = np.full((N, 7), np.nan)
+    for i in range(N):
+        if cube_pose_used[i] is not None:
+            cube_pose_used_arr[i] = np.asarray(cube_pose_used[i], dtype=float)
+
     np.savez_compressed(
         output_path,
         timeline=timeline,
         retargeted_qpos=retargeted_qpos,
         wrist_offset=wrist_offset,
+        target_shift=target_shift,
+        cube_pose_used=cube_pose_used_arr,
     )
     print(f"  Saved: {output_path}")
 
@@ -346,7 +400,12 @@ def replay_sequence(session_dir: Path, save_video: bool = False):
     timeline = np.asarray(npz["timeline"], dtype=float)
     retargeted_qpos = npz["retargeted_qpos"]
     N = len(timeline)
-    cube_pose_world = _load_cube_poses(session_dir, N)
+    # Prefer the shifted cube poses that were actually used for retargeting,
+    # so visualization matches the IK targets.
+    if "cube_pose_used" in npz.files:
+        cube_pose_world = npz["cube_pose_used"]
+    else:
+        cube_pose_world = _load_cube_poses(session_dir, N)
     _, right_fingertips_cube = _load_target_inputs(session_dir, N)
 
     model = mujoco.MjModel.from_xml_path(MODEL_PATH)
@@ -422,18 +481,26 @@ def _render_video(session_dir, model, data, timeline, retargeted_qpos, cube_pose
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def _parse_offset(args):
-    """Parse `--offset tx ty tz` from the CLI args list (modifies args in place)."""
-    if "--offset" in args:
-        i = args.index("--offset")
+def _parse_vec3(args, flag, default):
+    """Parse `<flag> tx ty tz` from CLI args list (modifies args in place)."""
+    if flag in args:
+        i = args.index(flag)
         try:
             tx, ty, tz = float(args[i+1]), float(args[i+2]), float(args[i+3])
         except (IndexError, ValueError):
-            print("Error: --offset requires three floats: --offset tx ty tz")
+            print(f"Error: {flag} requires three floats: {flag} tx ty tz")
             sys.exit(1)
         del args[i:i+4]
         return np.array([tx, ty, tz], dtype=float)
-    return DEFAULT_WRIST_OFFSET
+    return default
+
+
+def _parse_offset(args):
+    return _parse_vec3(args, "--offset", DEFAULT_WRIST_OFFSET)
+
+
+def _parse_target_shift(args):
+    return _parse_vec3(args, "--target-shift", DEFAULT_TARGET_SHIFT)
 
 
 def main():
@@ -443,12 +510,14 @@ def main():
     save_video  = "--save-video" in args
     force       = "--force" in args
     wrist_offset = _parse_offset(args)
+    target_shift = _parse_target_shift(args)
     paths = [Path(a) for a in args if not a.startswith("--")]
 
     if not paths:
         print(
             "Usage: python -m scripts.retargeting.retarget_sequence_cube_relative <session_dir>"
-            " [--viewer] [--replay] [--save-video] [--force] [--offset tx ty tz]"
+            " [--viewer] [--replay] [--save-video] [--force]"
+            " [--offset tx ty tz] [--target-shift tx ty tz]"
         )
         sys.exit(1)
 
@@ -458,7 +527,7 @@ def main():
             replay_sequence(p, save_video=save_video)
         else:
             retarget_offline(p, show_viewer=show_viewer, force=force,
-                             wrist_offset=wrist_offset)
+                             wrist_offset=wrist_offset, target_shift=target_shift)
             if save_video:
                 npz = _load_retargeted(p, "retargeted_sequence_cube_relative.npz")
                 timeline = np.asarray(npz["timeline"], dtype=float)

@@ -41,6 +41,7 @@ from scripts.retargeting.tesollo_runtime_baseline import (
     update_fingertip_targets_cube_frame,
     update_posture_target_from_joint_angles,
     update_relative_finger_targets,
+    update_wrist_task_target,
 )
 from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
 from scripts.retargeting.retarget_sequence_cube_relative import (
@@ -109,10 +110,14 @@ def _ik_one(model, mj_data, task_bundle, default_quats, fingertips, T_cube,
     update_relative_finger_targets(task_bundle)
     update_posture_target_from_joint_angles(task_bundle, ergonomics, T_robot_base)
     update_finger_frame_tasks_from_mocaps(model, mj_data, task_bundle)
+    update_wrist_task_target(task_bundle, T_robot_base)
     for _ in range(ik_steps):
         solve_ik_step(task_bundle, dt=IK_DT)
-        _pin_wrist_in_configuration(task_bundle, T_robot_base)
-    set_hand_base_pose(model, mj_data, T_robot_base)
+        # Hard-pin wrist translation; orientation stays soft.
+        task_bundle.configuration.q[0:3] = T_robot_base[:3, 3]
+        task_bundle.configuration.data.qpos[0:3] = T_robot_base[:3, 3]
+    mj_data.qpos[: task_bundle.configuration.q.shape[0]] = task_bundle.configuration.q
+    mujoco.mj_forward(model, mj_data)
 
 
 def _retarget_session(model, task_bundle, session, wrist_offset, ik_steps):
