@@ -33,9 +33,9 @@ def build_tesollo_task_bundle(
     relative_position_cost: float = 0.3,
     relative_orientation_cost: float = 0.0,
     relative_lm_damping: float = 1.0,
-    wrist_position_cost: float = 0.0,            # unused: position is hard-pinned each IK step
+    wrist_position_cost: float = 250.0,
     wrist_orientation_cost: float = 40.0,
-    wrist_lm_damping: float = 0.5,
+    wrist_lm_damping: float = 1.0,
     use_collision_avoidance: bool = False,
 ) -> TesolloTaskBundle:
     configuration = mink.Configuration(model)

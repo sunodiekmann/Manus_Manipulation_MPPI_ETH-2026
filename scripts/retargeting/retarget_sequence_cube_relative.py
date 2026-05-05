@@ -133,14 +133,6 @@ def _pin_wrist_in_configuration(task_bundle, T_world_wrist):
     q[6] = rot_xyzw[2]
 
 
-def _pin_wrist_position_only(task_bundle, T_world_wrist):
-    """Hard-pin the freejoint translation to T_world_wrist; leave quaternion free."""
-    if T_world_wrist is None:
-        return
-    pos = np.asarray(T_world_wrist, dtype=float)[:3, 3]
-    task_bundle.configuration.q[0:3] = pos
-    task_bundle.configuration.data.qpos[0:3] = pos
-
 
 def _set_cube_mocap(model, data, cube_pose):
     if cube_pose is None:
@@ -211,9 +203,6 @@ def _ik_frame(
 
     for _ in range(IK_STEPS):
         solve_ik_step(task_bundle, dt=IK_DT)
-        # Hard-pin wrist translation; orientation stays free (controlled by wrist task).
-        # Mirrors the real robot's wrist DOFs (3 rotational, no translation).
-        _pin_wrist_position_only(task_bundle, T_world_robot_base)
 
     # Sync mj_data.qpos with the IK-determined configuration so downstream
     # FK / mocap reads see the result.

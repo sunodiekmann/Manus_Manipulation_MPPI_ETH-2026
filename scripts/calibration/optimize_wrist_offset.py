@@ -115,7 +115,6 @@ def _ik_one(model, mj_data, task_bundle, default_quats, fingertips, T_cube,
         solve_ik_step(task_bundle, dt=IK_DT)
         # Hard-pin wrist translation; orientation stays soft.
         task_bundle.configuration.q[0:3] = T_robot_base[:3, 3]
-        task_bundle.configuration.data.qpos[0:3] = T_robot_base[:3, 3]
     mj_data.qpos[: task_bundle.configuration.q.shape[0]] = task_bundle.configuration.q
     mujoco.mj_forward(model, mj_data)
 

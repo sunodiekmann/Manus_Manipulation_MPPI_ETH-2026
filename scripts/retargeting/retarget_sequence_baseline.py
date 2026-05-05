@@ -186,11 +186,6 @@ def _ik_frame(model, mj_data, task_bundle, default_quats, fingertips, T_world_wr
 
     for _ in range(IK_STEPS):
         solve_ik_step(task_bundle, dt=IK_DT)
-        # Hard-pin wrist translation; orientation stays soft via wrist task.
-        if T_world_robot_base is not None:
-            pos = np.asarray(T_world_robot_base, dtype=float)[:3, 3]
-            task_bundle.configuration.q[0:3] = pos
-            task_bundle.configuration.data.qpos[0:3] = pos
 
     mj_data.qpos[: task_bundle.configuration.q.shape[0]] = task_bundle.configuration.q
     mujoco.mj_forward(model, mj_data)
