@@ -197,6 +197,97 @@ def _per_finger_target(pos_cube: np.ndarray, mask: np.ndarray):
     return target, std, valid
 
 
+MIN_PHASE_LEN = 5   # frames; shorter phases get dropped as edge-flicker noise
+
+
+def _cube_face_id(p: np.ndarray) -> int:
+    """Return which of the 6 cube faces a contact point is on.
+
+    Encoding: face = axis * 2 + (0 if positive, 1 if negative).
+    The face is the one whose plane the point is closest to in absolute terms
+    — equivalently, the axis of the largest |coordinate| component.
+    """
+    abs_p = np.abs(p)
+    axis = int(np.argmax(abs_p))
+    return axis * 2 + (0 if p[axis] >= 0.0 else 1)
+
+
+def _segment_contact_targets(
+    pos_cube: np.ndarray,    # (N, 5, 3) — NaN where mask is False
+    mask: np.ndarray,        # (N, 5) bool
+    min_phase_len: int = MIN_PHASE_LEN,
+):
+    """Per-finger phases segmented by which cube face the contact is on.
+
+    For each in-contact frame compute the dominant cube face (the one whose
+    plane the contact point is closest to). A new phase starts when the face
+    id changes from one in-contact frame to the next, or when a finger first
+    re-enters contact after a no-contact gap. Each phase's target is the
+    mean position over the phase — semantically "the finger's typical
+    contact location on face X". When the cube rolls and the finger
+    transitions to a new face, the phase boundary is crystal clear.
+
+    Returns
+    -------
+    target_per_frame : (N, 5, 3) — NaN where the finger is not in contact
+    valid_per_finger : (5,) bool — True if at least one phase exists
+    n_phases         : (5,) int  — total phases per finger
+    """
+    N, F = mask.shape
+    target_per_frame = np.full((N, F, 3), np.nan, dtype=float)
+    valid_per_finger = np.zeros(F, dtype=bool)
+    n_phases = np.zeros(F, dtype=int)
+
+    for f in range(F):
+        col = mask[:, f]
+        if not col.any():
+            continue
+
+        # Build per-frame face id (-1 = not in contact).
+        face_seq = np.full(N, -1, dtype=int)
+        for t in range(N):
+            if col[t]:
+                face_seq[t] = _cube_face_id(pos_cube[t, f])
+
+        # Walk through and accumulate by face id. A phase = all in-contact
+        # frames on the same cube face, possibly separated by short no-contact
+        # gaps. A new phase only starts when the face id actually CHANGES (not
+        # just because contact briefly dropped and resumed). Phases shorter
+        # than min_phase_len are dropped as face-flicker noise.
+        # Per-frame targets are assigned to the contact frames; gap frames
+        # keep NaN (no pull when not in contact).
+        phase_face = -2
+        phase_sum = np.zeros(3, dtype=float)
+        phase_n = 0
+        phase_frames: list[int] = []   # explicit list of in-contact frame indices for this phase
+        for t in range(N + 1):
+            cur_face = face_seq[t] if t < N else -1
+            face_changed = (cur_face != phase_face) and (cur_face >= 0)
+            ending = (t == N)
+            if face_changed or ending:
+                # Close the previous phase, if any.
+                if phase_face >= 0 and phase_n >= min_phase_len:
+                    mean = phase_sum / phase_n
+                    for pf in phase_frames:
+                        target_per_frame[pf, f] = mean
+                    n_phases[f] += 1
+                # Start a fresh phase (only if cur_face is a real contact).
+                if face_changed:
+                    phase_face = cur_face
+                    phase_sum = np.zeros(3, dtype=float)
+                    phase_n = 0
+                    phase_frames = []
+            if cur_face >= 0:
+                # Same face (or freshly opened): accumulate.
+                phase_sum += pos_cube[t, f]
+                phase_n += 1
+                phase_frames.append(t)
+
+        valid_per_finger[f] = n_phases[f] > 0
+
+    return target_per_frame, valid_per_finger, n_phases
+
+
 # ── stats ─────────────────────────────────────────────────────────────────────
 
 def _print_stats(name: str, mask: np.ndarray, timeline: np.ndarray,
@@ -257,6 +348,16 @@ def detect_contact_session(
     # raw was False: their pos_cube stays NaN.
     target, std, valid = _per_finger_target(pos_cube, raw_mask)
 
+    # Per-frame target: segment each finger's contact run by which cube face
+    # the contact is on. A new phase starts when the finger transitions to a
+    # different face. Each phase's target is the mean position over the phase.
+    # Semantically: "the finger's typical contact location on face X during
+    # this stretch of the motion." This naturally encodes the squeeze→regrab
+    # pattern of a rolling cube — each face change is a phase change.
+    target_per_frame, valid_per_frame, n_phases = _segment_contact_targets(
+        pos_cube, raw_mask,
+    )
+
     np.savez_compressed(
         output_path,
         contact_mask=smoothed,
@@ -264,6 +365,9 @@ def detect_contact_session(
         contact_target_cube=target,
         contact_target_std=std,
         contact_target_valid=valid,
+        contact_target_per_frame=target_per_frame,
+        contact_target_per_frame_valid=valid_per_frame,
+        contact_target_n_phases=n_phases,
         timeline=timeline,
         finger_names=np.array(FINGER_NAMES),
         smooth_half_window=SMOOTH_HALF_WINDOW,
@@ -273,6 +377,8 @@ def detect_contact_session(
 
     if print_stats:
         _print_stats(session_dir.name, smoothed, timeline, target, std, valid)
+        print("  segmentation phases per finger (face-based): "
+              + ", ".join(f"{FINGER_NAMES[f]}={int(n_phases[f])}" for f in range(N_FINGERS)))
 
 
 # ── main ──────────────────────────────────────────────────────────────────────

@@ -1,24 +1,15 @@
 [submodule "src/geort"]
 	path = src/geort
-	url = https://github.com/vhartman/GeoRT.git
-[submodule "ros_ws/src/delto_m_ros2"]
-	path = ros_ws/src/delto_m_ros2
-	url = git@github.com:vhartman/DELTO_M_ROS2.git
+	url = git@github.com:vhartman/GeoRT.git
 [submodule "src/manus"]
 	path = src/manus
-	url = https://github.com/vhartman/manus_teleop.git
+	url = git@github.com:vhartman/manus_teleop.git
 [submodule "src/mujoco_playground"]
 	path = src/mujoco_playground
-	url = https://github.com/vhartman/mujoco_playground.git
+	url = git@github.com:vhartman/mujoco_playground.git
 [submodule "src/tag-pose-estimation"]
 	path = src/tag-pose-estimation
-	url = https://github.com/kirandoshi/tag_pose_estimation.git
-[submodule "src/robot_ipc_control"]
-	path = src/robot_ipc_control
-	url = git@github.com:vhartman/robot_ipc_control.git
-[submodule "src/dexmachina"]
-	path = src/dexmachina
-	url = https://github.com/MandiZhao/dexmachina.git
-[submodule "/home/suno/robohand2/src/spider"]
-	path = /home/suno/robohand2/src/spider
-	url = https://github.com/facebookresearch/spider.git
+	url = git@github.com:kirandoshi/tag_pose_estimation.git
+[submodule "src/spider"]
+	path = src/spider
+	url = org-16943930@github.com:facebookresearch/spider.git

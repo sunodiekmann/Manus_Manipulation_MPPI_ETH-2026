@@ -80,7 +80,9 @@ VIDEO_WIDTH = 1280
 _IDENTITY_QUAT_XYZW = np.array([0.0, 0.0, 0.0, 1.0])
 
 # Wrist→robot-base translational offset, expressed in wrist frame (metres).
-DEFAULT_WRIST_OFFSET = np.zeros(3, dtype=float)
+# Optimized via scripts/calibration/optimize_wrist_offset.py against the
+# statics holds. Override with `--offset tx ty tz` if recalibrated.
+DEFAULT_WRIST_OFFSET = np.array([0.0043, 0.0064, -0.0268], dtype=float)
 
 
 def _apply_wrist_offset(T_world_wrist, offset):
