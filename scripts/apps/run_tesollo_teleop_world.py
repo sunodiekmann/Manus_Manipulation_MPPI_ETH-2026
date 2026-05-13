@@ -26,7 +26,7 @@ from scripts.retargeting.tesollo_constants import TARGET_SCALE, FINGERS
 # OFFLINE_TARGET_OFFSETS in retarget_sequence_cube_relative.py is calibrated
 # in cube frame and is not applicable to update_fingertip_targets_world_frame.
 OFFLINE_TARGET_OFFSETS = {f: np.zeros(3) for f in FINGERS}
-from scripts.retargeting.tesollo_runtime_baseline import (
+from scripts.retargeting.tesollo_ik_runtime import (
     initialize_targets_from_configuration,
     update_fingertip_targets_world_frame,
     update_relative_finger_targets,

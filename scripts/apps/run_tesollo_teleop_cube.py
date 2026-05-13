@@ -31,7 +31,7 @@ from scripts.utils.calibration_io import load_calibration_matrix
 
 from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
 from scripts.retargeting.tesollo_constants import TARGET_SCALE
-from scripts.retargeting.tesollo_runtime_baseline import (
+from scripts.retargeting.tesollo_ik_runtime import (
     initialize_targets_from_configuration,
 )
 from scripts.retargeting.tesollo_mujoco_utils import (

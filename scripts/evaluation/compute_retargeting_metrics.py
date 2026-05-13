@@ -10,8 +10,8 @@ Metric per finger per frame:
     error [mm] = ||robot_fingertip_cube - human_fingertip_cube||
 
 Inputs:
-    recordings/<session>/retargeted_sequence_baseline.npz   (retargeted_qpos)
-    recordings/<session>/processed_sequence_with_proxy.npz  (human fingertips + cube)
+    recordings/<session>/retargeted_sequence_cube_relative.npz  (retargeted_qpos)
+    recordings/<session>/processed_sequence_with_proxy.npz      (human fingertips + cube)
 
 Output:
     Console: per-finger mean ± std, overall mean ± std
@@ -44,7 +44,7 @@ def load_session(session_dir: Path):
     proxy_path      = session_dir / "processed_sequence_with_proxy.npz"
 
     if not retargeted_path.exists():
-        raise FileNotFoundError(f"Missing: {retargeted_path}\nRun retarget_sequence_baseline first.")
+        raise FileNotFoundError(f"Missing: {retargeted_path}\nRun retarget_sequence_cube_relative first.")
     if not proxy_path.exists():
         raise FileNotFoundError(f"Missing: {proxy_path}\nRun compute_proxy_geometry first.")
 
@@ -182,7 +182,7 @@ def plot_metrics(session_dir: Path, timeline: np.ndarray, errors_mm: np.ndarray)
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def find_sessions(root: Path):
-    return sorted(p.parent for p in root.rglob("retargeted_sequence_baseline.npz"))
+    return sorted(p.parent for p in root.rglob("retargeted_sequence_cube_relative.npz"))
 
 
 def main():
@@ -192,7 +192,7 @@ def main():
         sys.exit(1)
 
     root = Path(args[0])
-    if (root / "retargeted_sequence_baseline.npz").exists():
+    if (root / "retargeted_sequence_cube_relative.npz").exists():
         sessions = [root]
     else:
         sessions = find_sessions(root)

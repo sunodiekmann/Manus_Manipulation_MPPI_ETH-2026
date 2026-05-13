@@ -44,7 +44,7 @@ from scripts.retargeting.tesollo_mujoco_utils import (
     set_hand_base_pose,
     set_mocap_body_pose_from_matrix,
 )
-from scripts.retargeting.tesollo_runtime_baseline import (
+from scripts.retargeting.tesollo_ik_runtime import (
     initialize_targets_from_configuration,
     reset_relative_finger_targets,
     solve_ik_step,

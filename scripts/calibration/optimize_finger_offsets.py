@@ -31,7 +31,7 @@ from scripts.retargeting.tesollo_constants import FINGERS, TARGET_SCALE
 from scripts.retargeting.tesollo_mujoco_utils import (
     initialize_fingertip_target_mocaps,
 )
-from scripts.retargeting.tesollo_runtime_baseline import (
+from scripts.retargeting.tesollo_ik_runtime import (
     initialize_targets_from_configuration,
     solve_ik_step,
     update_finger_frame_tasks_from_mocaps,
