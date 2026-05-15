@@ -41,6 +41,8 @@ import mujoco
 import numpy as np
 from scipy.ndimage import label
 
+from scripts.utils.config import CUBE_SIZE
+
 # ── constants ─────────────────────────────────────────────────────────────────
 
 PHYSICS_XML = Path(__file__).resolve().parents[2] / "assets" / "output_mocap_physics.xml"
@@ -87,12 +89,17 @@ def _build_model():
 
 
 def _replay_session(retargeted_qpos: np.ndarray, cube_pose_used: np.ndarray):
-    """Replay the kinematic IK trajectory in physics for collision detection.
+    """Replay the kinematic IK trajectory and compute per-frame contact state.
 
     Returns
     -------
-    raw_mask     : (N, 5) bool — per-frame contact (raw, before smoothing)
-    pos_cube     : (N, 5, 3) — fingertip body pos in cube frame; NaN where no contact
+    geom_mask    : (N, 5) bool — geom collision (mj_forward) detected contact
+    pos_cube     : (N, 5, 3) — fingertip body pos in cube frame, **always**
+                    populated (not gated by collision). NaN only where the
+                    input cube pose is NaN.
+    sd_cube      : (N, 5) — signed distance of fingertip to nearest cube
+                    face, in metres. Negative = inside cube, positive =
+                    outside, ~0 = on surface. NaN where cube pose is NaN.
     """
     if retargeted_qpos.shape[1] != QPOS_HAND_LEN:
         raise ValueError(
@@ -106,12 +113,15 @@ def _replay_session(retargeted_qpos: np.ndarray, cube_pose_used: np.ndarray):
     model, data, tip_gid, cube_gid, geom_to_finger, wrist_mid = _build_model()
 
     N = retargeted_qpos.shape[0]
-    raw_mask = np.zeros((N, N_FINGERS), dtype=bool)
+    geom_mask = np.zeros((N, N_FINGERS), dtype=bool)
     pos_cube = np.full((N, N_FINGERS, 3), np.nan, dtype=float)
+    sd_cube = np.full((N, N_FINGERS), np.nan, dtype=float)
 
     qpos = np.zeros(QPOS_FULL_LEN, dtype=float)
 
     for i in range(N):
+        if np.any(np.isnan(cube_pose_used[i])) or np.any(np.isnan(retargeted_qpos[i])):
+            continue
         qpos[:QPOS_HAND_LEN] = retargeted_qpos[i]
         qpos[QPOS_HAND_LEN:] = cube_pose_used[i]
         data.qpos[:] = qpos
@@ -138,14 +148,15 @@ def _replay_session(retargeted_qpos: np.ndarray, cube_pose_used: np.ndarray):
             elif g2 == cube_gid and g1 in geom_to_finger:
                 in_contact[geom_to_finger[g1]] = True
 
-        # Fingertip position = geom centre, transformed to cube frame.
+        # Fingertip position in cube frame — always, regardless of contact.
         for f in range(N_FINGERS):
-            if in_contact[f]:
-                tip_pos_w = np.asarray(data.geom_xpos[tip_gid[f]])
-                pos_cube[i, f] = R_wc.T @ (tip_pos_w - cube_pos_w)
-        raw_mask[i] = in_contact
+            tip_pos_w = np.asarray(data.geom_xpos[tip_gid[f]])
+            p = R_wc.T @ (tip_pos_w - cube_pos_w)
+            pos_cube[i, f] = p
+            sd_cube[i, f] = float(np.abs(p).max() - _CUBE_HALF)
+        geom_mask[i] = in_contact
 
-    return raw_mask, pos_cube
+    return geom_mask, pos_cube, sd_cube
 
 
 # ── post-processing ───────────────────────────────────────────────────────────
@@ -198,6 +209,67 @@ def _per_finger_target(pos_cube: np.ndarray, mask: np.ndarray):
 
 
 MIN_PHASE_LEN = 5   # frames; shorter phases get dropped as edge-flicker noise
+# After segmentation, an A→B→A pattern where the middle B-phase is shorter
+# than this many frames is treated as segmentation noise (cube wobble flips
+# the dominant-axis face momentarily) and absorbed back into the surrounding
+# A-phase. Eliminates the back-and-forth face flipping that confuses MPPI.
+MIN_ABA_MERGE_LEN = 8
+# SD threshold (m) at which we consider a tip "in contact" even without a
+# geom collision being detected. Catches loose pushes (Stage 2a IK lands
+# 5-12 mm above the cube — collision misses, but the human intent was clearly
+# contact).
+SD_MASK_THRESHOLD = 0.005
+# Hysteresis margin: when the previous frame's face was X, switch to face Y
+# only when |coord_Y| exceeds |coord_X| by this margin. Prevents corner
+# flicker where two |coords| are nearly equal.
+FACE_HYSTERESIS_MARGIN_M = 0.004
+_CUBE_HALF = CUBE_SIZE / 2
+
+
+def _merge_short_ABA(target_per_frame: np.ndarray, min_phase_len: int) -> np.ndarray:
+    """Replace short A→B→A middles with the surrounding A-phase target.
+
+    Walks each finger's per-frame target sequence, identifies contiguous
+    runs of same face id, and where a short B run is sandwiched between
+    same-face A runs, rewrites the B frames to carry the A-phase's mean
+    target. Idempotent under multiple passes.
+    """
+    N, F = target_per_frame.shape[:2]
+    out = target_per_frame.copy()
+
+    for f in range(F):
+        # Build phases [start, end, face].
+        phases: list[list] = []
+        i = 0
+        while i < N:
+            p = out[i, f]
+            if np.any(np.isnan(p)):
+                i += 1
+                continue
+            face = _cube_face_id(p)
+            start = i
+            while i < N and not np.any(np.isnan(out[i, f])) and _cube_face_id(out[i, f]) == face:
+                i += 1
+            phases.append([start, i, face])
+
+        changed = True
+        while changed:
+            changed = False
+            j = 1
+            while j < len(phases) - 1:
+                pstart, pend, pface = phases[j - 1]
+                cstart, cend, cface = phases[j]
+                nstart, nend, nface = phases[j + 1]
+                cur_len = cend - cstart
+                if cur_len < min_phase_len and pface == nface:
+                    a_target = target_per_frame[pstart:pend, f].mean(axis=0)
+                    out[cstart:cend, f] = a_target
+                    phases[j - 1] = [pstart, nend, pface]
+                    del phases[j:j + 2]
+                    changed = True
+                else:
+                    j += 1
+    return out
 
 
 def _cube_face_id(p: np.ndarray) -> int:
@@ -210,6 +282,51 @@ def _cube_face_id(p: np.ndarray) -> int:
     abs_p = np.abs(p)
     axis = int(np.argmax(abs_p))
     return axis * 2 + (0 if p[axis] >= 0.0 else 1)
+
+
+def _face_ids_with_hysteresis(
+    pos_cube_seq: np.ndarray,    # (N, F, 3)
+    mask_seq: np.ndarray,         # (N, F) bool
+    margin_m: float = FACE_HYSTERESIS_MARGIN_M,
+) -> np.ndarray:
+    """Per-(frame, finger) face id with hysteresis (returns -1 where not in
+    contact). For each finger walks time in order: at the first in-contact
+    frame after a gap or sign flip, picks argmax(|coord|). On subsequent
+    frames keeps the previous face as long as its |coord| stays within
+    `margin_m` of the new argmax candidate — only commits to a new face if
+    the candidate clearly wins. Eliminates the corner-flicker oscillation
+    that bare argmax produces when two |coords| are nearly equal.
+    """
+    N, F = mask_seq.shape
+    face_seq = np.full((N, F), -1, dtype=int)
+    for f in range(F):
+        prev = -1
+        for t in range(N):
+            if not mask_seq[t, f] or np.any(np.isnan(pos_cube_seq[t, f])):
+                prev = -1
+                continue
+            p = pos_cube_seq[t, f]
+            abs_p = np.abs(p)
+            argmax_axis = int(np.argmax(abs_p))
+            argmax_face = argmax_axis * 2 + (0 if p[argmax_axis] >= 0.0 else 1)
+            if prev < 0:
+                face_seq[t, f] = argmax_face
+                prev = argmax_face
+                continue
+            prev_axis = prev // 2
+            prev_sign = 1.0 if (prev % 2 == 0) else -1.0
+            # Sign flip on the previous axis → unambiguous switch.
+            if np.sign(p[prev_axis]) != prev_sign and abs(p[prev_axis]) > 1e-6:
+                face_seq[t, f] = argmax_face
+                prev = argmax_face
+                continue
+            # Stay on prev unless a different axis wins by margin.
+            if argmax_axis != prev_axis and abs_p[argmax_axis] - abs_p[prev_axis] > margin_m:
+                face_seq[t, f] = argmax_face
+                prev = argmax_face
+            else:
+                face_seq[t, f] = prev
+    return face_seq
 
 
 def _segment_contact_targets(
@@ -238,16 +355,15 @@ def _segment_contact_targets(
     valid_per_finger = np.zeros(F, dtype=bool)
     n_phases = np.zeros(F, dtype=int)
 
+    # Per-(frame, finger) face id with hysteresis to suppress corner flicker.
+    face_seq_all = _face_ids_with_hysteresis(pos_cube, mask)
+
     for f in range(F):
         col = mask[:, f]
         if not col.any():
             continue
 
-        # Build per-frame face id (-1 = not in contact).
-        face_seq = np.full(N, -1, dtype=int)
-        for t in range(N):
-            if col[t]:
-                face_seq[t] = _cube_face_id(pos_cube[t, f])
+        face_seq = face_seq_all[:, f]
 
         # Walk through and accumulate by face id. A phase = all in-contact
         # frames on the same cube face, possibly separated by short no-contact
@@ -318,16 +434,70 @@ def _print_stats(name: str, mask: np.ndarray, timeline: np.ndarray,
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
+def _apply_manual_constraints(
+    constraints,                # (N, 5) of {-2, -1, 0..5} from manual_contacts.load_constraints
+    mask: np.ndarray,            # (N, 5) bool — pre-constraint contact mask
+    pos_cube: np.ndarray,        # (N, 5, 3) — fingertip cube-frame positions
+    target_per_frame: np.ndarray, # (N, 5, 3) — segmented contact target (will be patched)
+):
+    """Enforce manual constraints on the detection output:
+
+    - FORBIDDEN (-2): set mask=False; clear target.
+    - Face-bound (0..5): if mask is True, project the per-frame target onto
+      the constrained face (the segmenter may have chosen a neighbouring
+      face due to noise — manual wins).
+    """
+    if constraints is None:
+        return mask, target_per_frame
+    from scripts.retargeting.manual_contacts import FORBIDDEN, project_target_onto_face
+
+    out_mask = mask.copy()
+    out_target = target_per_frame.copy()
+    N, F = mask.shape
+    for t in range(N):
+        for f in range(F):
+            code = int(constraints[t, f])
+            if code == FORBIDDEN:
+                out_mask[t, f] = False
+                out_target[t, f] = np.nan
+                continue
+            if code >= 0 and mask[t, f]:
+                # If the per-frame target is NaN (segmenter dropped it for
+                # being a short phase) we leave it NaN — but the mask stays.
+                tgt = out_target[t, f]
+                if not np.any(np.isnan(tgt)):
+                    out_target[t, f] = project_target_onto_face(tgt, code, _CUBE_HALF)
+    return out_mask, out_target
+
+
 def detect_contact_session(
     session_dir: Path,
     force: bool = False,
     print_stats: bool = False,
+    from_feasible: bool = True,
+    sd_mask_threshold_m: float = SD_MASK_THRESHOLD,
 ) -> None:
-    retarget_path = session_dir / "retargeted_sequence_cube_relative.npz"
-    if not retarget_path.exists():
+    """Run contact detection on the chosen retargeting stage's output.
+
+    Reads `retargeted_sequence_feasible.npz` by default (Stage 2c, post-snap).
+    Falls back to Stage 2a (`retargeted_sequence_cube_relative.npz`) if 2c
+    isn't present or `from_feasible=False`. The mask combines geom collision
+    with a SD-near-surface fallback so loose pushes (tip 5-10 mm above the
+    cube) still register as intended contact.
+    """
+    feasible_path = session_dir / "retargeted_sequence_feasible.npz"
+    cube_rel_path = session_dir / "retargeted_sequence_cube_relative.npz"
+    if from_feasible and feasible_path.exists():
+        retarget_path = feasible_path
+        qpos_key, cube_key = "retargeted_qpos", "cube_pose_smoothed"
+        source_label = "Stage 2c (feasible)"
+    elif cube_rel_path.exists():
+        retarget_path = cube_rel_path
+        qpos_key, cube_key = "retargeted_qpos", "cube_pose_used"
+        source_label = "Stage 2a (cube_relative)"
+    else:
         raise FileNotFoundError(
-            f"retargeted_sequence_cube_relative.npz not found in {session_dir}.\n"
-            "Run scripts.retargeting.retarget_sequence_cube_relative first."
+            f"Neither {feasible_path.name} nor {cube_rel_path.name} in {session_dir}."
         )
 
     output_path = session_dir / "contact_sequence.npz"
@@ -335,33 +505,49 @@ def detect_contact_session(
         print("  [skip] contact_sequence.npz already exists (--force to overwrite)")
         return
 
+    print(f"  source: {source_label}  ({retarget_path.name})")
     data = np.load(retarget_path, allow_pickle=True)
     timeline = np.asarray(data["timeline"], dtype=float)
-    retargeted_qpos = np.asarray(data["retargeted_qpos"], dtype=float)
-    cube_pose_used = np.asarray(data["cube_pose_used"], dtype=float)
+    retargeted_qpos = np.asarray(data[qpos_key], dtype=float)
+    cube_pose_used = np.asarray(data[cube_key], dtype=float)
 
-    raw_mask, pos_cube = _replay_session(retargeted_qpos, cube_pose_used)
+    geom_mask, pos_cube, sd_cube = _replay_session(retargeted_qpos, cube_pose_used)
+    # SD-based fallback contact: tip within `sd_mask_threshold_m` of the cube
+    # surface counts as contact even without a detected collision.
+    sd_mask = (sd_cube <= sd_mask_threshold_m) & ~np.isnan(sd_cube)
+    raw_mask = geom_mask | sd_mask
+    n_geom = int(geom_mask.sum()); n_sd_only = int((sd_mask & ~geom_mask).sum())
+    print(f"  contact frames: geom={n_geom}  sd-only (≤{sd_mask_threshold_m*1000:.1f} mm)={n_sd_only}")
+
     smoothed = _smooth_mask(raw_mask, SMOOTH_HALF_WINDOW)
-
-    # Drop pos_cube samples that smoothing newly added (no recorded position
-    # at those frames) — keep them NaN. Drop frames the smoothing kept where
-    # raw was False: their pos_cube stays NaN.
     target, std, valid = _per_finger_target(pos_cube, raw_mask)
 
-    # Per-frame target: segment each finger's contact run by which cube face
-    # the contact is on. A new phase starts when the finger transitions to a
-    # different face. Each phase's target is the mean position over the phase.
-    # Semantically: "the finger's typical contact location on face X during
-    # this stretch of the motion." This naturally encodes the squeeze→regrab
-    # pattern of a rolling cube — each face change is a phase change.
+    # Per-frame face-based segmentation with hysteresis (in `_segment_contact_targets`).
     target_per_frame, valid_per_frame, n_phases = _segment_contact_targets(
         pos_cube, raw_mask,
     )
+    # Collapse A→B→A segmentation noise.
+    target_per_frame = _merge_short_ABA(target_per_frame, MIN_ABA_MERGE_LEN)
+
+    # Manual constraints (optional JSON sidecar): force "no contact" or
+    # "must be on face X" per (finger, time range).
+    from scripts.retargeting.manual_contacts import load_constraints
+    constraints = load_constraints(session_dir, timeline)
+    if constraints is not None:
+        from scripts.retargeting.manual_contacts import FORBIDDEN, UNCONSTRAINED
+        smoothed, target_per_frame = _apply_manual_constraints(
+            constraints, smoothed, pos_cube, target_per_frame,
+        )
+        n_forbidden = int((constraints == FORBIDDEN).sum())
+        n_facebound = int((constraints >= 0).sum())
+        print(f"  manual constraints: {n_forbidden} forbid-contact frames, "
+              f"{n_facebound} face-bound frames")
 
     np.savez_compressed(
         output_path,
         contact_mask=smoothed,
         contact_pos_cube=pos_cube,
+        contact_sd=sd_cube,
         contact_target_cube=target,
         contact_target_std=std,
         contact_target_valid=valid,
@@ -372,6 +558,8 @@ def detect_contact_session(
         finger_names=np.array(FINGER_NAMES),
         smooth_half_window=SMOOTH_HALF_WINDOW,
         max_target_std_m=MAX_TARGET_STD_M,
+        sd_mask_threshold_m=np.asarray(sd_mask_threshold_m),
+        source=source_label,
     )
     print(f"  Saved: {output_path}")
 
@@ -384,22 +572,38 @@ def detect_contact_session(
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    args = sys.argv[1:]
-    force = "--force" in args
-    stats = "--stats" in args
-    paths = [Path(a) for a in args if not a.startswith("--")]
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("session_dirs", nargs="+", type=Path)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--stats", action="store_true")
+    parser.add_argument("--from-stage-2a", action="store_true",
+                        help="Source from Stage 2a (retargeted_sequence_cube_relative.npz) "
+                             "instead of the default Stage 2c (feasible).")
+    parser.add_argument("--sd-threshold", type=float, default=SD_MASK_THRESHOLD,
+                        help="SD threshold (m) below which the tip is considered "
+                             "in contact even without a geom collision. Catches "
+                             f"loose pushes. Default {SD_MASK_THRESHOLD*1000:.1f} mm.")
+    cli_args, _ = parser.parse_known_args()
+    paths = cli_args.session_dirs
 
     if not paths:
         print(
             "Usage: python -m scripts.retargeting.spider_contact <session_dir>..."
-            " [--stats] [--force]"
+            " [--stats] [--force] [--from-stage-2a] [--sd-threshold M]"
         )
         sys.exit(1)
 
     for p in paths:
         print(f"\n{p.name}")
         try:
-            detect_contact_session(p, force=force, print_stats=stats)
+            detect_contact_session(
+                p,
+                force=cli_args.force,
+                print_stats=cli_args.stats,
+                from_feasible=not cli_args.from_stage_2a,
+                sd_mask_threshold_m=cli_args.sd_threshold,
+            )
         except Exception as e:
             print(f"  [error] {e}")
             raise

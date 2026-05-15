@@ -67,12 +67,25 @@ def run_session(session_dir: Path, force: bool, cfg: MPPIConfig, seed: int,
                 warmup_closure: float = 0.0,
                 loop_closure: float = 0.0,
                 drop_threshold_m: float = 0.10) -> None:
-    retarget_path = session_dir / "retargeted_sequence_cube_relative.npz"
+    feasible_path = session_dir / "retargeted_sequence_feasible.npz"
+    cube_rel_path = session_dir / "retargeted_sequence_cube_relative.npz"
     contact_path = session_dir / "contact_sequence.npz"
     out_path = session_dir / "retargeted_sequence_dynamic.npz"
 
-    if not retarget_path.exists():
-        raise FileNotFoundError(f"missing {retarget_path}")
+    # Prefer Stage 2c feasibility-IK output; fall back to Stage 2a cube-relative.
+    if feasible_path.exists():
+        retarget_path = feasible_path
+        cube_key = "cube_pose_smoothed"
+        print(f"  using Stage 2c plan: {retarget_path.name}")
+    elif cube_rel_path.exists():
+        retarget_path = cube_rel_path
+        cube_key = "cube_pose_used"
+        print(f"  using Stage 2a plan: {retarget_path.name}  "
+              f"(Stage 2c output not found)")
+    else:
+        raise FileNotFoundError(
+            f"missing both {feasible_path.name} and {cube_rel_path.name}"
+        )
     if not contact_path.exists():
         raise FileNotFoundError(f"missing {contact_path}")
     if out_path.exists() and not force:
@@ -82,7 +95,7 @@ def run_session(session_dir: Path, force: bool, cfg: MPPIConfig, seed: int,
     rt = np.load(retarget_path)
     timeline = np.asarray(rt["timeline"], dtype=float)
     qpos_ref = np.asarray(rt["retargeted_qpos"], dtype=float)        # (N, 27)
-    cube_ref = np.asarray(rt["cube_pose_used"], dtype=float)         # (N, 7)
+    cube_ref = np.asarray(rt[cube_key], dtype=float)                 # (N, 7)
     cm = np.load(contact_path)
     contact_mask_seq = np.asarray(cm["contact_mask"], dtype=bool)    # (N, 5)
     contact_target_cube = np.asarray(cm["contact_target_cube"], dtype=float)  # (5, 3)

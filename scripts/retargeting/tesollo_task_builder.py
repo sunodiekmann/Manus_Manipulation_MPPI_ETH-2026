@@ -37,6 +37,9 @@ def build_tesollo_task_bundle(
     wrist_orientation_cost: float = 40.0,
     wrist_lm_damping: float = 1.0,
     use_collision_avoidance: bool = False,
+    geom_pairs: list | None = None,
+    collision_min_distance: float = 0.002,
+    collision_detection_distance: float = 0.01,
 ) -> TesolloTaskBundle:
     configuration = mink.Configuration(model)
 
@@ -81,7 +84,9 @@ def build_tesollo_task_bundle(
         limits.append(
             mink.CollisionAvoidanceLimit(
                 model=model,
-                geom_pairs=COLLISION_PAIRS,
+                geom_pairs=geom_pairs if geom_pairs is not None else COLLISION_PAIRS,
+                minimum_distance_from_collisions=collision_min_distance,
+                collision_detection_distance=collision_detection_distance,
             )
         )
 

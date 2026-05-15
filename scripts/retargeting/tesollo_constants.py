@@ -32,9 +32,39 @@ COLLISION_PAIRS = [
     ),
     (
         ["little_tip"],
-        ["ring_base", "ring_before_tip"],
+        ["ring_base", "ring_mp"],
     ),
 ]
+
+
+# Stage 2c (retarget_sequence_feasible): the hand has *two* qualitatively
+# different relationships with the cube. Fingertips are *supposed* to touch it
+# (that's the whole task). Every other finger part and the palm should *never*
+# touch it. We enforce these with two separate CollisionAvoidanceLimit blocks,
+# each with its own minimum distance:
+#
+#   FEASIBILITY_NONTIP_PAIRS  — hard 5 mm clearance for non-tip finger links
+#                                and the palm against the cube.
+#   FEASIBILITY_TIP_PAIRS     — soft ≈0 mm clearance so tips can rest on the
+#                                cube surface during scheduled contact, but the
+#                                IK never drives them deep into the box.
+_FINGER_TIP_GEOMS = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "little_tip"]
+_FINGER_NONTIP_GEOMS = [
+    f"{finger}_{seg}"
+    for finger in ("thumb", "index", "middle", "ring", "little")
+    for seg in ("base", "pp", "mp", "dp")
+] + ["little_palmar"]
+_PALM_GEOMS = ["palm_upper", "palm_lower"]
+
+FEASIBILITY_NONTIP_PAIRS = [
+    (_FINGER_NONTIP_GEOMS + _PALM_GEOMS, ["tracked_cube_geom"]),
+]
+FEASIBILITY_TIP_PAIRS = [
+    (_FINGER_TIP_GEOMS, ["tracked_cube_geom"]),
+]
+# Combined pair list, retained for callers that want a single CollisionAvoidance
+# limit with one uniform min-distance (mostly diagnostics / tests).
+FEASIBILITY_COLLISION_PAIRS = FEASIBILITY_NONTIP_PAIRS + FEASIBILITY_TIP_PAIRS
 
 SOLVER_NAME = "daqp"
 
