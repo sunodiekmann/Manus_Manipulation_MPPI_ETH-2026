@@ -2,6 +2,8 @@
 
 This document is the **starting brief for a fresh session** that rewrites the offline retargeting pipeline along SPIDER's architectural lines while keeping the cube-specific advantages we've built (face segmentation, manual constraints).
 
+> **Status (2026-05-17, commit 5723a92):** Phases 0-3 + 5 done. Stage 3 (Phase 4) MPC architecture fully wired on mujoco_warp; tuning in progress (cube tracks early then drifts, drops mid-sequence). See "Phase 4 actual status" near bottom for handoff notes.
+
 ## Why we're rewriting
 
 We accumulated a stack of bespoke workarounds — Pass-1 cube smoother, Pass-2 feasibility IK with snap-to-surface, whole-finger CollisionAvoidanceLimit, A→B→A merge, smooth blend weights — because our gradient-IK (mink) can't gracefully relax when targets are infeasible. SPIDER avoids the entire problem by using **MuJoCo physics with equality-constraint springs** for IK; the same simulator handles both IK and MPC. Their MPC also has critical structural pieces ours lacks: a **virtual stick** on the object that prevents drop-at-start, **resample-on-drop**, **per-component noise scaling**, and a **2048-sample budget**. The result is robust enough to handle 6 datasets × multiple robots out of the box.
@@ -256,3 +258,49 @@ When in doubt, look at these files in `src/spider/spider/`:
 - **Resample-on-drop**: `optimizers/sampling.py:141-178`.
 - **Per-component noise**: `config.py:330-374` (`get_noise_scale`).
 - **Cross-entropy weights**: `optimizers/sampling.py:204-237`.
+- **CUDA Graph capture for mjwp.step**: `simulators/mjwp.py:52-68` (`_compile_step` + `wp.ScopedCapture`). 11× per-step speedup at small N.
+- **Reward terms**: `simulators/mjwp.py:275-351` (`get_reward`, `get_terminal_reward`). Note `qvel_rew` and `terminal_rew_scale`.
+
+---
+
+## Phase 4 actual status (2026-05-17)
+
+Open question 1 (XML inheritance): resolved → programmatic via `MjSpec`.
+Open question 2 (MJX or CPU): resolved → went **mujoco_warp** (`mujoco-warp` PyPI), CUDA-graph capture for ~11× per-step speedup. CPU backend kept as fallback (`--backend cpu`).
+Open question 3 (per-finger torque): partially done — fingertip `solimp` width scaled ×3 for ring/little.
+
+### What landed in the MPC code
+
+- Action layout 29-dim: `[20 finger ctrls, 3 wrist axis-angle delta, 3 obj_pos, 3 obj_rot]`.
+- Per-component noise (decoupled finger/wrist/obj scales, defaults `0.15 / 0.04 / 0.0 / 0.0` rad — obj noise *off* by default because it's wasted with stick=0 and counterproductive with stick=1).
+- Per-iter `beta_traj=0.7` and per-horizon-step log anneal `1.0 → 0.3`.
+- Zero-noise sample 0 (prior plan always evaluated).
+- Top-10% softmax weighting (`_topk_softmax`).
+- Resample-on-drop inside the horizon loop (`rollout_with_resample`), threshold via `--drop-threshold`.
+- **Iter-based virtual stick** (`iter_stick_schedule`, default `warm_then_off`): iter 0 = full stick, iters 1+ = stick off. **World step always uses stick=0** — stick is an optimizer warm-start, never real-physics aid.
+- Wrist-frame `--cube-pos-deadband` (2 cm bubble of zero penalty around the ref).
+- `--cube-shift X Y Z` (wrist-frame translation of cube ref) — for when the recorded cube starts too close to the palm.
+- `--w-qvel` velocity penalty (default 0.05) — encourages stable equilibrium.
+- `--terminal-scale` (default 10) — multiplies the H-1 step reward to fix myopic drift.
+- `--stale-rotation-window` early termination.
+
+### What's not working yet
+
+cube_pitch / cube_roll at N=2048 × 8 iters track well for ~50 frames then drift over the sequence; cube drops around t=140-170. Diagnosis (last session, see memory):
+- Myopic MPC drift: per-tick plan looks fine locally but accumulates error. Terminal reward fix landed but **not yet run**.
+- IK fingertip pose is "touching the cube surface" not "wrapping for force closure"; even modest squeeze pushes the cube. `--warmup-closure 0` is essential (otherwise the warmup squeeze shoves the cube 49 mm off-ref).
+
+### Next-session run
+
+```
+.venv/bin/python -u -m scripts.retargeting.optimize_sequence_dynamic recordings/cube_roll \
+  --force --backend mjwp --num-samples 2048 --iters 8 --substeps 25 \
+  --cube-shift 0.02 0 -0.01 --cube-pos-deadband 0.02 \
+  --w-finger-qpos 0.3 --w-cube-quat 1.0 --w-contact 1.0 \
+  --w-qvel 0.05 --terminal-scale 10 \
+  --warmup-closure 0.0 --loop-closure 0.2 \
+  --iter-stick-schedule warm_then_off
+```
+
+If still drifting: bump `--terminal-scale 30`, or `--w-qvel 0.2`, or accept some cube push with `--loop-closure 0.4`.
+For cube_pitch specifically (in-hand rotation): also try `--horizon 16` (doubles runtime).
