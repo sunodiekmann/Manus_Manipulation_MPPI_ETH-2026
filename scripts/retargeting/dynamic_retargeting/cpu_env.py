@@ -1,17 +1,23 @@
-"""CPU MuJoCo environment for batched MPPI rollouts.
+"""CPU MuJoCo environment for Stage 3 sampling MPC.
 
-Holds one MjModel and `num_samples` MjData instances. Each MjData carries
-its own state and mocap fields, so per-sample wrist-orientation
-perturbations are trivially supported.
+Loads the *dyn* scene from `build_ik_scene.compile_dyn`: cube freejoint is
+replaced by 3 slide + 3 hinge joints with position-style actuators (the
+"virtual stick"). Action vector is 29-dim per step:
 
-Action layout (per step, per sample):
-    a[:20]   — finger position-actuator targets (replaces data.ctrl)
-    a[20:23] — wrist-orientation axis-angle delta, applied as
-               mocap_quat = ref_wrist_quat ⊗ exp(delta)
+    a[ 0:20] — finger position-actuator targets (replaces data.ctrl[:20])
+    a[20:23] — wrist-orientation axis-angle delta (mocap rotation perturb)
+    a[23:26] — cube position target (slide actuator ctrl)
+    a[26:29] — cube rotation target (hinge actuator ctrl, intrinsic XYZ Euler)
 
-The wrist *position* is always pinned to the reference (no sampling), and
-the weld equality pulls the hand body to the mocap target. Cube is a true
-free body driven by physics.
+Wrist *position* mocap is always pinned to the reference. The actuator gain
+on the six cube DOFs is scaled at runtime via `set_obj_decay` to implement
+the virtual-stick decay schedule (early MPC ticks: stick on, fingers free
+to settle; late ticks: stick off, fingers must hold).
+
+Two environment objects:
+    `world`  — one MjData advanced once per MPC tick with the chosen plan.
+    `batch`  — N MjData for sampled rollouts, stepped horizon-by-horizon so
+               we can interleave resample-on-drop swaps between sites.
 """
 from __future__ import annotations
 
@@ -20,268 +26,73 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
-# qpos layout in output_mocap_physics.xml: hand freejoint (7) + finger joints (20) + cube freejoint (7).
-N_HAND_QPOS = 27
-N_CUBE_QPOS = 7
+from scripts.retargeting.build_ik_scene import compile_dyn, scale_obj_actuators
+
+
+# Action / state layout constants — kept here so mppi.py and reward.py
+# can reuse them without knowing about MjSpec specifics.
+N_HAND_QPOS = 27                 # wrist freejoint (7) + 20 finger joints
+N_CUBE_QPOS = 6                  # cube_pos_xyz + cube_rot_xyz (intrinsic XYZ)
+
 N_FINGER_CTRL = 20
 N_WRIST_DELTA = 3
-N_ACTION = N_FINGER_CTRL + N_WRIST_DELTA  # 23
+N_OBJ_POS_CTRL = 3
+N_OBJ_ROT_CTRL = 3
+N_OBJ_CTRL = N_OBJ_POS_CTRL + N_OBJ_ROT_CTRL
+N_ACTION = N_FINGER_CTRL + N_WRIST_DELTA + N_OBJ_CTRL  # 29
+
+# Slice helpers — index a (..., A) action array.
+SLICE_FINGER = slice(0, N_FINGER_CTRL)
+SLICE_WRIST = slice(N_FINGER_CTRL, N_FINGER_CTRL + N_WRIST_DELTA)
+SLICE_OBJ_POS = slice(N_FINGER_CTRL + N_WRIST_DELTA,
+                      N_FINGER_CTRL + N_WRIST_DELTA + N_OBJ_POS_CTRL)
+SLICE_OBJ_ROT = slice(N_FINGER_CTRL + N_WRIST_DELTA + N_OBJ_POS_CTRL,
+                      N_ACTION)
 
 FINGER_NAMES = ["thumb", "index", "middle", "ring", "little"]
 TIP_GEOMS = [f"{f}_tip" for f in FINGER_NAMES]
 TIP_BODIES = ["rl_dg_1_4", "rl_dg_2_4", "rl_dg_3_4", "rl_dg_4_4", "rl_dg_5_4"]
 CUBE_GEOM = "tracked_cube_geom"
-CUBE_BODY = "tracked_cube"
 WRIST_MOCAP = "wrist_mocap"
 
 
 @dataclass
 class EnvIds:
-    """Resolved MuJoCo ids cached at setup."""
-    wrist_mocap: int          # mocap index
-    cube_qadr: int            # qpos index where cube freejoint starts
-    cube_body_id: int
+    wrist_mocap: int
+    cube_qadr: int               # qpos start of the 6 cube DOFs
+    cube_dofadr: int             # qvel start of the 6 cube DOFs
     cube_geom_id: int
-    tip_body_ids: list[int]   # length 5
-    tip_geom_ids: list[int]   # length 5
+    tip_geom_ids: list[int]
+    finger_act_lo: np.ndarray    # (20,)  ctrlrange[:, 0] for fingers
+    finger_act_hi: np.ndarray    # (20,)
 
 
-class CpuEnv:
-    """One MjModel + N MjData rollout buffers + 1 outer 'world' MjData."""
-
-    def __init__(self, xml_path: Path, num_samples: int):
-        self.model = mujoco.MjModel.from_xml_path(str(xml_path))
-        self.num_samples = num_samples
-        self.world = mujoco.MjData(self.model)
-        self.batch = [mujoco.MjData(self.model) for _ in range(num_samples)]
-        self.ids = self._resolve_ids()
-        if self.model.nq != N_HAND_QPOS + N_CUBE_QPOS:
-            raise ValueError(
-                f"Model nq={self.model.nq}, expected {N_HAND_QPOS + N_CUBE_QPOS}"
-            )
-        if self.model.nu != N_FINGER_CTRL:
-            raise ValueError(f"Model nu={self.model.nu}, expected {N_FINGER_CTRL}")
-        # Constant offset added to every finger ctrl (world + rollouts) so
-        # position-controlled actuators apply real grip force around the IK
-        # plan. Zero by default; set via set_closure_bias().
-        self.ctrl_bias = np.zeros(N_FINGER_CTRL, dtype=np.float64)
-
-    def set_closure_bias(self, bias_rad: float) -> None:
-        """Set a constant flexion-direction offset added to every finger ctrl.
-        Applies to both world.step and rollout_batch — the same effective
-        actuator command is seen by predictions and the applied step.
-        """
-        self.ctrl_bias = bias_rad * self._flexion_closure_direction()
-        # Clip to a sensible bound to keep ctrl within actuator ranges later.
-
-    def _resolve_ids(self) -> EnvIds:
-        m = self.model
-        wrist_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, WRIST_MOCAP)
-        wrist_mid = int(m.body_mocapid[wrist_bid])
-        if wrist_mid < 0:
-            raise ValueError("wrist_mocap is not a mocap body")
-        cube_jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "cube_freejoint")
-        cube_qadr = int(m.jnt_qposadr[cube_jid])
-        cube_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, CUBE_BODY)
-        cube_gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, CUBE_GEOM)
-        tip_bids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, n) for n in TIP_BODIES]
-        tip_gids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, n) for n in TIP_GEOMS]
-        if any(i < 0 for i in (cube_qadr, cube_bid, cube_gid, *tip_bids, *tip_gids)):
-            raise ValueError("Failed to resolve required ids in physics XML")
-        return EnvIds(
-            wrist_mocap=wrist_mid,
-            cube_qadr=cube_qadr,
-            cube_body_id=cube_bid,
-            cube_geom_id=cube_gid,
-            tip_body_ids=tip_bids,
-            tip_geom_ids=tip_gids,
-        )
-
-    # ── state I/O ──────────────────────────────────────────────────────────
-
-    def set_world_state(
-        self,
-        qpos: np.ndarray,
-        cube_pose: np.ndarray,
-        qvel: np.ndarray | None = None,
-    ) -> None:
-        """Initialise the outer world to a known kinematic state."""
-        self.world.qpos[:N_HAND_QPOS] = qpos
-        self.world.qpos[self.ids.cube_qadr : self.ids.cube_qadr + N_CUBE_QPOS] = cube_pose
-        if qvel is None:
-            self.world.qvel[:] = 0.0
-        else:
-            self.world.qvel[:] = qvel
-        self.world.mocap_pos[self.ids.wrist_mocap] = qpos[0:3]
-        self.world.mocap_quat[self.ids.wrist_mocap] = qpos[3:7]
-        mujoco.mj_forward(self.model, self.world)
-
-    def _flexion_closure_direction(self) -> np.ndarray:
-        """Per finger-joint closure direction (+1, -1, or 0 for abduction joints).
-
-        Inferred from joint range: ranges starting at 0 close in +q direction,
-        ranges ending at 0 close in -q direction, ranges straddling 0 are
-        abduction-style and get no closure bias.
-        """
-        n_ctrl = N_FINGER_CTRL
-        # Joints 7..27 in qpos correspond to ctrl 0..19 (1:1 since the only
-        # other joint is the hand freejoint at qpos[:7]).
-        # Use jnt_range to infer closure direction.
-        d = np.zeros(n_ctrl, dtype=np.float64)
-        for i in range(n_ctrl):
-            # joint index = i+1 (skip hand freejoint at index 0)
-            lo, hi = self.model.jnt_range[i + 1]
-            if lo >= 0.0 and hi > 0.0:
-                d[i] = 1.0
-            elif hi <= 0.0 and lo < 0.0:
-                d[i] = -1.0
-            else:
-                d[i] = 0.0   # abduction / straddles zero
-        return d
-
-    def warmup_grasp(
-        self,
-        cube_pose: np.ndarray,
-        finger_ctrl: np.ndarray,
-        ref_wrist_pos: np.ndarray,
-        ref_wrist_quat: np.ndarray,
-        n_steps: int,
-        closure_bias: float = 0.0,
-    ) -> None:
-        """SPIDER-style virtual-stick initial grasp.
-
-        Pin the cube at `cube_pose` and step physics with `finger_ctrl` so
-        fingers settle into a stable grip before MPPI takes over. Cube qpos
-        is overwritten and qvel zeroed after every substep, effectively
-        welding the cube in place; finger PD response, contact friction
-        normals, and collisions all develop naturally.
-
-        `closure_bias` adds a per-joint offset toward the flexion direction
-        on every finger ctrl during warmup, so position-controlled actuators
-        actively *squeeze* into the cube rather than just settling at the IK
-        position with zero force.
-        """
-        if n_steps <= 0:
-            return
-        cube_qadr = self.ids.cube_qadr
-        cube_jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "cube_freejoint")
-        cube_dofadr = int(self.model.jnt_dofadr[cube_jid])
-        ctrl = np.asarray(finger_ctrl, dtype=np.float64).copy()
-        if closure_bias > 0.0:
-            ctrl += closure_bias * self._flexion_closure_direction()
-            # Clamp to actuator control ranges so PD doesn't saturate weirdly.
-            ctrl = np.clip(ctrl, self.model.actuator_ctrlrange[:, 0],
-                                  self.model.actuator_ctrlrange[:, 1])
-        self.world.qpos[cube_qadr : cube_qadr + N_CUBE_QPOS] = cube_pose
-        self.world.qvel[cube_dofadr : cube_dofadr + 6] = 0.0
-        self.world.ctrl[:] = ctrl
-        self.world.mocap_pos[self.ids.wrist_mocap] = ref_wrist_pos
-        self.world.mocap_quat[self.ids.wrist_mocap] = ref_wrist_quat
-        for _ in range(n_steps):
-            mujoco.mj_step(self.model, self.world)
-            self.world.qpos[cube_qadr : cube_qadr + N_CUBE_QPOS] = cube_pose
-            self.world.qvel[cube_dofadr : cube_dofadr + 6] = 0.0
-
-    def snapshot_world_into_batch(self) -> None:
-        """Copy world's (qpos, qvel) into every batch sample as the rollout init."""
-        for d in self.batch:
-            d.qpos[:] = self.world.qpos
-            d.qvel[:] = self.world.qvel
-            d.mocap_pos[:] = self.world.mocap_pos
-            d.mocap_quat[:] = self.world.mocap_quat
-            d.time = 0.0
-
-    def step_world(self, action: np.ndarray, ref_wrist_pos: np.ndarray,
-                   ref_wrist_quat: np.ndarray, n_substeps: int) -> None:
-        """Advance the outer world by one MPC tick using `action`.
-
-        action: (23,) — first 20 are finger ctrls, last 3 are wrist axis-angle delta
-        ref_wrist_*: reference wrist pose this tick (mocap pos is locked to it)
-        n_substeps: how many mj_step at sim_dt to make one MPC tick
-        """
-        ctrl = action[:N_FINGER_CTRL] + self.ctrl_bias
-        ctrl = np.clip(ctrl, self.model.actuator_ctrlrange[:, 0],
-                              self.model.actuator_ctrlrange[:, 1])
-        delta_axisangle = action[N_FINGER_CTRL:]
-        wrist_quat = quat_mul(ref_wrist_quat, axis_angle_to_quat(delta_axisangle))
-
-        self.world.ctrl[:] = ctrl
-        self.world.mocap_pos[self.ids.wrist_mocap] = ref_wrist_pos
-        self.world.mocap_quat[self.ids.wrist_mocap] = wrist_quat
-        for _ in range(n_substeps):
-            mujoco.mj_step(self.model, self.world)
-
-    def rollout_batch(
-        self,
-        actions: np.ndarray,        # (N, H, 23)
-        ref_wrist_pos: np.ndarray,  # (H, 3)
-        ref_wrist_quat: np.ndarray, # (H, 4)
-        n_substeps: int,
-    ) -> np.ndarray:
-        """Roll all N samples through the H-step horizon. Returns observations
-        used by the reward function: dict of arrays, all shape (N, H, ...)."""
-        N, H, _ = actions.shape
-        obs = {
-            "qpos": np.zeros((N, H, self.model.nq), dtype=np.float64),
-            "qvel": np.zeros((N, H, self.model.nv), dtype=np.float64),
-            "tip_xpos": np.zeros((N, H, 5, 3), dtype=np.float64),
-            "cube_pos": np.zeros((N, H, 3), dtype=np.float64),
-            "cube_quat": np.zeros((N, H, 4), dtype=np.float64),
-            "tip_in_contact": np.zeros((N, H, 5), dtype=bool),
-        }
-        for i, d in enumerate(self.batch):
-            for h in range(H):
-                action = actions[i, h]
-                ctrl = action[:N_FINGER_CTRL] + self.ctrl_bias
-                ctrl = np.clip(ctrl, self.model.actuator_ctrlrange[:, 0],
-                                      self.model.actuator_ctrlrange[:, 1])
-                delta = action[N_FINGER_CTRL:]
-                wrist_quat = quat_mul(ref_wrist_quat[h], axis_angle_to_quat(delta))
-                d.ctrl[:] = ctrl
-                d.mocap_pos[self.ids.wrist_mocap] = ref_wrist_pos[h]
-                d.mocap_quat[self.ids.wrist_mocap] = wrist_quat
-                for _ in range(n_substeps):
-                    mujoco.mj_step(self.model, d)
-                obs["qpos"][i, h] = d.qpos
-                obs["qvel"][i, h] = d.qvel
-                cube_qadr = self.ids.cube_qadr
-                obs["cube_pos"][i, h] = d.qpos[cube_qadr : cube_qadr + 3]
-                obs["cube_quat"][i, h] = d.qpos[cube_qadr + 3 : cube_qadr + 7]
-                for f, tip_gid in enumerate(self.ids.tip_geom_ids):
-                    obs["tip_xpos"][i, h, f] = d.geom_xpos[tip_gid]
-                # Detect which tips are in contact with the cube this step.
-                tip_gid_set = set(self.ids.tip_geom_ids)
-                cube_gid = self.ids.cube_geom_id
-                for c in range(d.ncon):
-                    g1, g2 = int(d.contact.geom1[c]), int(d.contact.geom2[c])
-                    other = None
-                    if g1 == cube_gid and g2 in tip_gid_set:
-                        other = g2
-                    elif g2 == cube_gid and g1 in tip_gid_set:
-                        other = g1
-                    if other is not None:
-                        f = self.ids.tip_geom_ids.index(other)
-                        obs["tip_in_contact"][i, h, f] = True
-        return obs
+def quat_to_euler_xyz_intrinsic(quat_wxyz: np.ndarray) -> np.ndarray:
+    """Convert wxyz quaternion → 3 intrinsic XYZ Euler angles matching the
+    dyn scene joint chain (cube_rot_x, cube_rot_y, cube_rot_z in body frame).
+    """
+    quat_xyzw = np.asarray([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]])
+    return R.from_quat(quat_xyzw).as_euler("XYZ", degrees=False)
 
 
-# ── small math helpers ────────────────────────────────────────────────────────
+def euler_xyz_to_quat_wxyz(euler_xyz: np.ndarray) -> np.ndarray:
+    """Inverse of `quat_to_euler_xyz_intrinsic` for diagnostics / reward."""
+    q_xyzw = R.from_euler("XYZ", euler_xyz, degrees=False).as_quat()
+    return np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
 
 
-def axis_angle_to_quat(axisangle: np.ndarray) -> np.ndarray:
-    """(3,) axis-angle → (4,) quaternion (wxyz). Returns identity if magnitude is 0."""
+def axis_angle_to_quat_wxyz(axisangle: np.ndarray) -> np.ndarray:
     angle = float(np.linalg.norm(axisangle))
     if angle < 1e-9:
         return np.array([1.0, 0.0, 0.0, 0.0])
     axis = axisangle / angle
-    half = 0.5 * angle
-    s = np.sin(half)
-    return np.array([np.cos(half), axis[0] * s, axis[1] * s, axis[2] * s])
+    s = np.sin(0.5 * angle)
+    return np.array([np.cos(0.5 * angle), axis[0] * s, axis[1] * s, axis[2] * s])
 
 
-def quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """Hamilton product, both inputs/output wxyz."""
+def quat_mul_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     w1, x1, y1, z1 = q1
     w2, x2, y2, z2 = q2
     return np.array([
@@ -292,10 +103,219 @@ def quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     ])
 
 
-def quat_rotate_vec(q: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Rotate vector v by quaternion q (wxyz). Vectorised over leading dims."""
-    w, x, y, z = q[..., 0:1], q[..., 1:2], q[..., 2:3], q[..., 3:4]
-    # 2 * cross(q.xyz, v)
-    qv = np.concatenate([x, y, z], axis=-1)
-    t = 2.0 * np.cross(qv, v)
-    return v + w * t + np.cross(qv, t)
+def cube_qpos_from_pose7(pose7: np.ndarray) -> np.ndarray:
+    """[x,y,z,qw,qx,qy,qz]  →  (6,) cube_qpos for the dyn scene."""
+    pos = np.asarray(pose7[:3], dtype=float)
+    euler = quat_to_euler_xyz_intrinsic(np.asarray(pose7[3:7], dtype=float))
+    return np.concatenate([pos, euler])
+
+
+def cube_pose7_from_qpos(cube_qpos: np.ndarray) -> np.ndarray:
+    """(6,) dyn cube_qpos → [x,y,z,qw,qx,qy,qz] pose vector."""
+    pos = cube_qpos[:3]
+    quat = euler_xyz_to_quat_wxyz(cube_qpos[3:6])
+    return np.concatenate([pos, quat])
+
+
+class CpuEnv:
+    """Sequential CPU rollout env. Owns 1 world + N batch MjData."""
+
+    def __init__(self, num_samples: int, sim_dt: float = 0.002):
+        self.model, _ = compile_dyn(sim_dt=sim_dt)
+        self.num_samples = num_samples
+        self.world = mujoco.MjData(self.model)
+        self.batch = [mujoco.MjData(self.model) for _ in range(num_samples)]
+        self.ids = self._resolve_ids()
+        if self.model.nq != N_HAND_QPOS + N_CUBE_QPOS:
+            raise ValueError(f"Model nq={self.model.nq}, expected "
+                             f"{N_HAND_QPOS + N_CUBE_QPOS}")
+        if self.model.nu != N_FINGER_CTRL + N_OBJ_CTRL:
+            raise ValueError(f"Model nu={self.model.nu}, expected "
+                             f"{N_FINGER_CTRL + N_OBJ_CTRL}")
+        self.ctrl_bias = np.zeros(N_FINGER_CTRL, dtype=np.float64)
+        self.obj_decay = 1.0  # current virtual-stick scale (full = 1, off = 0)
+
+    def _resolve_ids(self) -> EnvIds:
+        m = self.model
+        wrist_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, WRIST_MOCAP)
+        wrist_mid = int(m.body_mocapid[wrist_bid])
+        cube_jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "cube_pos_x")
+        cube_qadr = int(m.jnt_qposadr[cube_jid])
+        cube_dofadr = int(m.jnt_dofadr[cube_jid])
+        cube_gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, CUBE_GEOM)
+        tip_gids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, n) for n in TIP_GEOMS]
+        if any(i < 0 for i in (wrist_mid, cube_qadr, cube_dofadr, cube_gid, *tip_gids)):
+            raise ValueError("Failed to resolve required ids in dyn scene")
+        # Finger actuators are the first 20 (defined before the 6 cube actuators).
+        finger_lo = m.actuator_ctrlrange[:N_FINGER_CTRL, 0].copy()
+        finger_hi = m.actuator_ctrlrange[:N_FINGER_CTRL, 1].copy()
+        return EnvIds(
+            wrist_mocap=wrist_mid,
+            cube_qadr=cube_qadr,
+            cube_dofadr=cube_dofadr,
+            cube_geom_id=cube_gid,
+            tip_geom_ids=tip_gids,
+            finger_act_lo=finger_lo,
+            finger_act_hi=finger_hi,
+        )
+
+    # ── virtual-stick scaling ─────────────────────────────────────────────
+
+    def set_obj_decay(self, factor: float) -> None:
+        """Scale the 6 cube actuator gains by `factor` (0…1)."""
+        self.obj_decay = float(factor)
+        scale_obj_actuators(self.model, factor)
+
+    def set_closure_bias(self, bias_rad: float) -> None:
+        self.ctrl_bias = bias_rad * self._flexion_closure_direction()
+
+    def _flexion_closure_direction(self) -> np.ndarray:
+        d = np.zeros(N_FINGER_CTRL, dtype=np.float64)
+        for i in range(N_FINGER_CTRL):
+            lo, hi = self.model.jnt_range[i + 1]   # +1 skips hand freejoint
+            if lo >= 0.0 and hi > 0.0:
+                d[i] = 1.0
+            elif hi <= 0.0 and lo < 0.0:
+                d[i] = -1.0
+        return d
+
+    # ── world I/O ─────────────────────────────────────────────────────────
+
+    def set_world_state(self, hand_qpos: np.ndarray, cube_pose7: np.ndarray,
+                        qvel: np.ndarray | None = None) -> None:
+        cube_q = cube_qpos_from_pose7(cube_pose7)
+        self.world.qpos[:N_HAND_QPOS] = hand_qpos
+        self.world.qpos[self.ids.cube_qadr : self.ids.cube_qadr + N_CUBE_QPOS] = cube_q
+        self.world.qvel[:] = 0.0 if qvel is None else qvel
+        self.world.mocap_pos[self.ids.wrist_mocap] = hand_qpos[0:3]
+        self.world.mocap_quat[self.ids.wrist_mocap] = hand_qpos[3:7]
+        mujoco.mj_forward(self.model, self.world)
+
+    def get_world_cube_pose7(self) -> np.ndarray:
+        cube_q = self.world.qpos[self.ids.cube_qadr : self.ids.cube_qadr + N_CUBE_QPOS]
+        return cube_pose7_from_qpos(cube_q)
+
+    def get_world_cube_pos(self) -> np.ndarray:
+        return self.world.qpos[self.ids.cube_qadr : self.ids.cube_qadr + 3].copy()
+
+    # ── action application ────────────────────────────────────────────────
+
+    def _apply_action_to_data(self, data: mujoco.MjData, action: np.ndarray,
+                              ref_wrist_pos: np.ndarray,
+                              ref_wrist_quat: np.ndarray) -> None:
+        finger_ctrl = np.clip(action[SLICE_FINGER] + self.ctrl_bias,
+                              self.ids.finger_act_lo, self.ids.finger_act_hi)
+        delta = action[SLICE_WRIST]
+        wrist_quat = quat_mul_wxyz(ref_wrist_quat, axis_angle_to_quat_wxyz(delta))
+        data.ctrl[:N_FINGER_CTRL] = finger_ctrl
+        data.ctrl[N_FINGER_CTRL : N_FINGER_CTRL + N_OBJ_POS_CTRL] = action[SLICE_OBJ_POS]
+        data.ctrl[N_FINGER_CTRL + N_OBJ_POS_CTRL : N_FINGER_CTRL + N_OBJ_CTRL] = action[SLICE_OBJ_ROT]
+        data.mocap_pos[self.ids.wrist_mocap] = ref_wrist_pos
+        data.mocap_quat[self.ids.wrist_mocap] = wrist_quat
+
+    def step_world(self, action: np.ndarray, ref_wrist_pos: np.ndarray,
+                   ref_wrist_quat: np.ndarray, n_substeps: int) -> None:
+        self._apply_action_to_data(self.world, action, ref_wrist_pos, ref_wrist_quat)
+        for _ in range(n_substeps):
+            mujoco.mj_step(self.model, self.world)
+
+    # ── batched rollout ───────────────────────────────────────────────────
+
+    def snapshot_world_into_batch(self) -> None:
+        for d in self.batch:
+            d.qpos[:] = self.world.qpos
+            d.qvel[:] = self.world.qvel
+            d.ctrl[:] = self.world.ctrl
+            d.mocap_pos[:] = self.world.mocap_pos
+            d.mocap_quat[:] = self.world.mocap_quat
+            d.time = 0.0
+
+    def rollout_with_resample(
+        self,
+        actions: np.ndarray,            # (N, H, 29)  — MAY be modified in place
+        ref_wrist_pos: np.ndarray,      # (H, 3)
+        ref_wrist_quat: np.ndarray,     # (H, 4)
+        n_substeps: int,
+        ref_cube_pos: np.ndarray,       # (H, 3)
+        drop_threshold_m: float | None = None,
+    ) -> dict:
+        """Roll out all N samples through the H-step horizon, stepping
+        horizon-by-horizon so we can swap dropped-cube samples with good
+        ones between steps (SPIDER resample-on-drop). Returns observations
+        used by the reward function plus per-sample terminate flag.
+        """
+        N = self.num_samples
+        H = actions.shape[1]
+        obs = {
+            "qpos": np.zeros((N, H, self.model.nq), dtype=np.float64),
+            "cube_pos": np.zeros((N, H, 3), dtype=np.float64),
+            "cube_quat_wxyz": np.zeros((N, H, 4), dtype=np.float64),
+            "tip_xpos": np.zeros((N, H, 5, 3), dtype=np.float64),
+            "tip_in_contact": np.zeros((N, H, 5), dtype=bool),
+        }
+        terminated = np.zeros(N, dtype=bool)
+        rng = np.random.default_rng()
+        cube_gid = self.ids.cube_geom_id
+        tip_gids = self.ids.tip_geom_ids
+        tip_gid_set = set(tip_gids)
+        cube_qadr = self.ids.cube_qadr
+
+        for h in range(H):
+            ref_wpos_h = ref_wrist_pos[h]
+            ref_wquat_h = ref_wrist_quat[h]
+            for i in range(N):
+                d = self.batch[i]
+                self._apply_action_to_data(d, actions[i, h], ref_wpos_h, ref_wquat_h)
+                for _ in range(n_substeps):
+                    mujoco.mj_step(self.model, d)
+                # observation
+                obs["qpos"][i, h] = d.qpos
+                obs["cube_pos"][i, h] = d.qpos[cube_qadr : cube_qadr + 3]
+                obs["cube_quat_wxyz"][i, h] = euler_xyz_to_quat_wxyz(
+                    d.qpos[cube_qadr + 3 : cube_qadr + 6])
+                for f, gid in enumerate(tip_gids):
+                    obs["tip_xpos"][i, h, f] = d.geom_xpos[gid]
+                for c in range(d.ncon):
+                    g1, g2 = int(d.contact.geom1[c]), int(d.contact.geom2[c])
+                    other = None
+                    if g1 == cube_gid and g2 in tip_gid_set:
+                        other = g2
+                    elif g2 == cube_gid and g1 in tip_gid_set:
+                        other = g1
+                    if other is not None:
+                        obs["tip_in_contact"][i, h, tip_gids.index(other)] = True
+
+            # Resample-on-drop between horizon steps: replace samples whose
+            # cube has slipped beyond `drop_threshold_m` of the reference by
+            # cloning a good sample's state + ctrl history. Doesn't run on
+            # the last step (no future steps would benefit).
+            if (drop_threshold_m is not None
+                    and h < H - 1
+                    and not terminated.all()):
+                cube_pos_err = np.linalg.norm(
+                    obs["cube_pos"][:, h] - ref_cube_pos[h], axis=-1)
+                dropped = (cube_pos_err > drop_threshold_m) & ~terminated
+                good = ~dropped & ~terminated
+                if dropped.any() and good.any():
+                    bad_idx = np.where(dropped)[0]
+                    good_idx = np.where(good)[0]
+                    picks = rng.choice(good_idx, size=bad_idx.shape[0], replace=True)
+                    for bi, gi in zip(bad_idx, picks):
+                        bd, gd = self.batch[bi], self.batch[gi]
+                        bd.qpos[:] = gd.qpos
+                        bd.qvel[:] = gd.qvel
+                        bd.ctrl[:] = gd.ctrl
+                        bd.mocap_pos[:] = gd.mocap_pos
+                        bd.mocap_quat[:] = gd.mocap_quat
+                        # Copy ctrl history through current step so downstream
+                        # reward sees the *applied* sequence.
+                        actions[bi, : h + 1] = actions[gi, : h + 1]
+                        # Copy observations through current step too — keeps
+                        # per-sample obs trace internally consistent.
+                        for key in obs:
+                            obs[key][bi, : h + 1] = obs[key][gi, : h + 1]
+                elif dropped.all():
+                    terminated |= dropped  # nothing to copy from; let them be
+
+        obs["terminated"] = terminated
+        return obs

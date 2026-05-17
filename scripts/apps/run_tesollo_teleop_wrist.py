@@ -21,8 +21,8 @@ from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
 from scripts.retargeting.tesollo_constants import FINGERS, TARGET_SCALE
 
 # Wrist-frame fingertip-target offsets. Kept zero here: the cube-relative
-# OFFLINE_TARGET_OFFSETS in retarget_sequence_cube_relative.py is calibrated
-# in cube frame and is not applicable to update_fingertip_targets_wrist_frame.
+# OFFLINE_TARGET_OFFSETS in tesollo_calibration.py is calibrated in cube
+# frame and is not applicable to update_fingertip_targets_wrist_frame.
 OFFLINE_TARGET_OFFSETS = {f: np.zeros(3) for f in FINGERS}
 from scripts.retargeting.tesollo_ik_runtime import (
     initialize_targets_from_configuration,

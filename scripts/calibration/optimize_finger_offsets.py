@@ -40,10 +40,11 @@ from scripts.retargeting.tesollo_ik_runtime import (
     update_relative_finger_targets,
     update_wrist_task_target,
 )
-from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
-from scripts.retargeting.retarget_sequence_cube_relative import (
-    MODEL_PATH, DEFAULT_WRIST_OFFSET, _apply_wrist_offset,
+from scripts.retargeting.tesollo_calibration import (
+    DEFAULT_WRIST_OFFSET, apply_wrist_offset,
 )
+from scripts.retargeting.tesollo_mink_ik import MODEL_PATH
+from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
 from scripts.utils.config import CUBE_SIZE
 from scripts.utils.transforms import pose_to_matrix
 
@@ -134,7 +135,7 @@ def _retarget_session(model, task_bundle, session, wrist_offset, offsets, ik_ste
     cube_seq       = session["cube_pose"]
 
     T_cube_0 = pose_to_matrix(np.asarray(cube_seq[0], dtype=float))
-    T_robot_0 = _apply_wrist_offset(np.asarray(wrist_seq[0], dtype=float), wrist_offset)
+    T_robot_0 = apply_wrist_offset(np.asarray(wrist_seq[0], dtype=float), wrist_offset)
     for _ in range(WARMUP_CALLS):
         _ik_one(model, mj_data, task_bundle, default_quats,
                 fingertips_seq[0], T_cube_0, T_robot_0, ergo_seq[0], ik_steps, offsets)
@@ -142,7 +143,7 @@ def _retarget_session(model, task_bundle, session, wrist_offset, offsets, ik_ste
     out = []
     for i in range(len(fingertips_seq)):
         T_cube = pose_to_matrix(np.asarray(cube_seq[i], dtype=float))
-        T_robot = _apply_wrist_offset(np.asarray(wrist_seq[i], dtype=float), wrist_offset)
+        T_robot = apply_wrist_offset(np.asarray(wrist_seq[i], dtype=float), wrist_offset)
         _ik_one(model, mj_data, task_bundle, default_quats,
                 fingertips_seq[i], T_cube, T_robot, ergo_seq[i], ik_steps, offsets)
         out.append((task_bundle.configuration.q.copy(), T_cube.copy()))
@@ -335,8 +336,8 @@ def main():
 
     print(f"\nTotal evaluations: {eval_count[0]}")
 
-    # Snippet to paste into retarget_sequence_cube_relative.py.
-    print("\nPaste into scripts/retargeting/retarget_sequence_cube_relative.py:\n")
+    # Snippet to paste into tesollo_calibration.py.
+    print("\nPaste into scripts/retargeting/tesollo_calibration.py:\n")
     print("OFFLINE_TARGET_OFFSETS = {")
     for f in FINGERS:
         o = final_offsets[f]

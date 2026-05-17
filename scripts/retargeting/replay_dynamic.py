@@ -67,11 +67,11 @@ def replay(session_dir: Path, speed: float, show_ref: bool, loop: bool):
 
     cube_ref = None
     if show_ref:
-        ref_path = session_dir / "retargeted_sequence_cube_relative.npz"
+        ref_path = session_dir / "retargeted_sequence.npz"
         if ref_path.exists():
             cube_ref = np.asarray(np.load(ref_path)["cube_pose_used"], dtype=float)
         else:
-            print(f"  [warn] no kinematic reference at {ref_path.name}; ghost disabled")
+            print(f"  [warn] no Stage 2 reference at {ref_path.name}; ghost disabled")
 
     rew_max = dyn.get("rew_max")
     rew_mean = dyn.get("rew_mean")

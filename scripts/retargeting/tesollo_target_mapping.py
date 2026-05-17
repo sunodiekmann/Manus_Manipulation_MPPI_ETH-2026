@@ -35,38 +35,6 @@ def _clamp_target_outside_cube(p_cube: np.ndarray) -> np.ndarray:
     return out
 
 
-def _snap_target_to_surface(
-    p_cube: np.ndarray,
-    snap_outside_band_m: float,
-) -> np.ndarray:
-    """Snap an outside-but-near target exactly onto the nearest cube face.
-
-    A finger hovering a few mm above the cube during a push is almost always
-    an intended contact that fell short due to glove vs robot-tip calibration
-    error. Within `snap_outside_band_m` of the dominant face, project the
-    target onto SD=0 so the IK drives the tip into actual contact rather than
-    leaving a small gap.
-
-    Compose with `_clamp_target_outside_cube`: call clamp first to handle
-    inside-the-cube targets, then snap to pull any outside-but-near remainder
-    onto the surface. p_cube is in cube frame (AABB centre = origin).
-    """
-    if snap_outside_band_m <= 0.0:
-        return p_cube
-    abs_p = np.abs(p_cube)
-    max_abs = abs_p.max()
-    if max_abs <= _CUBE_HALF:
-        return p_cube                          # inside or on surface
-    dist_to_face = max_abs - _CUBE_HALF
-    if dist_to_face > snap_outside_band_m:
-        return p_cube                          # genuine clearance, don't snap
-    idx = int(np.argmax(abs_p))
-    out = p_cube.copy()
-    sign = 1.0 if p_cube[idx] >= 0.0 else -1.0
-    out[idx] = sign * _CUBE_HALF
-    return out
-
-
 def rotate_local_fingertip_quaternion(quat_xyzw, finger: str) -> R:
     q_rotated = R.from_quat(quat_xyzw) * R_X * R_Z
     if finger == "thumb_tip":
@@ -103,7 +71,6 @@ def map_cube_frame_target(
     T_world_from_wrist,
     offsets=None,
     scale: float = TARGET_SCALE,
-    snap_outside_band_m: float = 0.0,
 ):
     """Map a fingertip position expressed in cube frame to a world-frame IK target.
 
@@ -132,15 +99,9 @@ def map_cube_frame_target(
     # cannot guarantee outside-cube targets across sequences whose grip is
     # firmer than the statics holds the offsets were fit to.
     pos_cube_adjusted = _clamp_target_outside_cube(pos_cube_adjusted)
-    # Stage 2c contact-intent snap: pulls outside-but-near targets onto the
-    # cube surface so calibration-short pushes still register as contact.
-    # Off by default (band=0); callers opt in.
-    pos_cube_adjusted = _snap_target_to_surface(pos_cube_adjusted, snap_outside_band_m)
 
     pos_world = R_world_cube @ pos_cube_adjusted + t_world_cube
 
-    # Use wrist rotation for orientation — keeps the same target quat as the
-    # world-frame baseline so the IK converges to the same local minimum.
     q_local = rotate_local_fingertip_quaternion(quat_wrist_xyzw, finger)
     q_world = R.from_matrix(R_world_wrist) * q_local
 

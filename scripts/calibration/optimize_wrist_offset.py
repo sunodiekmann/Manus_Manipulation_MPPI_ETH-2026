@@ -43,11 +43,13 @@ from scripts.retargeting.tesollo_ik_runtime import (
     update_relative_finger_targets,
     update_wrist_task_target,
 )
-from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
-from scripts.retargeting.retarget_sequence_cube_relative import (
-    MODEL_PATH, OFFLINE_TARGET_OFFSETS, _apply_wrist_offset,
-    _pin_wrist_in_configuration,
+from scripts.retargeting.tesollo_calibration import (
+    OFFLINE_TARGET_OFFSETS, apply_wrist_offset,
 )
+from scripts.retargeting.tesollo_mink_ik import (
+    MODEL_PATH, _pin_wrist_in_configuration,
+)
+from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
 from scripts.utils.config import CUBE_SIZE
 from scripts.utils.transforms import pose_to_matrix
 
@@ -134,7 +136,7 @@ def _retarget_session(model, task_bundle, session, wrist_offset, ik_steps):
 
     # Warm-up on the first frame so IK converges from whatever previous state.
     T_cube_0 = pose_to_matrix(np.asarray(cube_seq[0], dtype=float))
-    T_robot_0 = _apply_wrist_offset(np.asarray(wrist_seq[0], dtype=float), wrist_offset)
+    T_robot_0 = apply_wrist_offset(np.asarray(wrist_seq[0], dtype=float), wrist_offset)
     for _ in range(WARMUP_CALLS):
         _ik_one(model, mj_data, task_bundle, default_quats,
                 fingertips_seq[0], T_cube_0, T_robot_0, ergo_seq[0], ik_steps)
@@ -142,7 +144,7 @@ def _retarget_session(model, task_bundle, session, wrist_offset, ik_steps):
     out = []
     for i in range(len(fingertips_seq)):
         T_cube = pose_to_matrix(np.asarray(cube_seq[i], dtype=float))
-        T_robot = _apply_wrist_offset(np.asarray(wrist_seq[i], dtype=float), wrist_offset)
+        T_robot = apply_wrist_offset(np.asarray(wrist_seq[i], dtype=float), wrist_offset)
         _ik_one(model, mj_data, task_bundle, default_quats,
                 fingertips_seq[i], T_cube, T_robot, ergo_seq[i], ik_steps)
         out.append((task_bundle.configuration.q.copy(), T_cube.copy()))

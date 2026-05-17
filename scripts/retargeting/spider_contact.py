@@ -15,7 +15,7 @@ Why physics replay (vs. point-distance to cube faces):
     rollouts share the same collision geometry — no shape mismatch.
 
 Inputs (per session):
-    recordings/<session>/retargeted_sequence_cube_relative.npz
+    recordings/<session>/retargeted_sequence.npz   (Stage 2: SPIDER equality IK)
         retargeted_qpos (N, 27)  — wrist freejoint + 20 finger joints
         cube_pose_used  (N, 7)   — [x,y,z,qw,qx,qy,qz]
 
@@ -474,30 +474,19 @@ def detect_contact_session(
     session_dir: Path,
     force: bool = False,
     print_stats: bool = False,
-    from_feasible: bool = True,
     sd_mask_threshold_m: float = SD_MASK_THRESHOLD,
 ) -> None:
-    """Run contact detection on the chosen retargeting stage's output.
+    """Run contact detection on Stage 2 (SPIDER equality-IK) output.
 
-    Reads `retargeted_sequence_feasible.npz` by default (Stage 2c, post-snap).
-    Falls back to Stage 2a (`retargeted_sequence_cube_relative.npz`) if 2c
-    isn't present or `from_feasible=False`. The mask combines geom collision
-    with a SD-near-surface fallback so loose pushes (tip 5-10 mm above the
-    cube) still register as intended contact.
+    The mask combines geom collision with a SD-near-surface fallback so
+    loose pushes (tip 5-10 mm above the cube) still register as intended
+    contact.
     """
-    feasible_path = session_dir / "retargeted_sequence_feasible.npz"
-    cube_rel_path = session_dir / "retargeted_sequence_cube_relative.npz"
-    if from_feasible and feasible_path.exists():
-        retarget_path = feasible_path
-        qpos_key, cube_key = "retargeted_qpos", "cube_pose_smoothed"
-        source_label = "Stage 2c (feasible)"
-    elif cube_rel_path.exists():
-        retarget_path = cube_rel_path
-        qpos_key, cube_key = "retargeted_qpos", "cube_pose_used"
-        source_label = "Stage 2a (cube_relative)"
-    else:
+    retarget_path = session_dir / "retargeted_sequence.npz"
+    if not retarget_path.exists():
         raise FileNotFoundError(
-            f"Neither {feasible_path.name} nor {cube_rel_path.name} in {session_dir}."
+            f"{retarget_path.name} not found in {session_dir}. "
+            "Run scripts.retargeting.retarget_sequence_spider first."
         )
 
     output_path = session_dir / "contact_sequence.npz"
@@ -505,11 +494,11 @@ def detect_contact_session(
         print("  [skip] contact_sequence.npz already exists (--force to overwrite)")
         return
 
-    print(f"  source: {source_label}  ({retarget_path.name})")
+    print(f"  source: SPIDER IK  ({retarget_path.name})")
     data = np.load(retarget_path, allow_pickle=True)
     timeline = np.asarray(data["timeline"], dtype=float)
-    retargeted_qpos = np.asarray(data[qpos_key], dtype=float)
-    cube_pose_used = np.asarray(data[cube_key], dtype=float)
+    retargeted_qpos = np.asarray(data["retargeted_qpos"], dtype=float)
+    cube_pose_used = np.asarray(data["cube_pose_used"], dtype=float)
 
     geom_mask, pos_cube, sd_cube = _replay_session(retargeted_qpos, cube_pose_used)
     # SD-based fallback contact: tip within `sd_mask_threshold_m` of the cube
@@ -559,7 +548,7 @@ def detect_contact_session(
         smooth_half_window=SMOOTH_HALF_WINDOW,
         max_target_std_m=MAX_TARGET_STD_M,
         sd_mask_threshold_m=np.asarray(sd_mask_threshold_m),
-        source=source_label,
+        source="SPIDER IK",
     )
     print(f"  Saved: {output_path}")
 
@@ -577,9 +566,6 @@ def main():
     parser.add_argument("session_dirs", nargs="+", type=Path)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--stats", action="store_true")
-    parser.add_argument("--from-stage-2a", action="store_true",
-                        help="Source from Stage 2a (retargeted_sequence_cube_relative.npz) "
-                             "instead of the default Stage 2c (feasible).")
     parser.add_argument("--sd-threshold", type=float, default=SD_MASK_THRESHOLD,
                         help="SD threshold (m) below which the tip is considered "
                              "in contact even without a geom collision. Catches "
@@ -590,7 +576,7 @@ def main():
     if not paths:
         print(
             "Usage: python -m scripts.retargeting.spider_contact <session_dir>..."
-            " [--stats] [--force] [--from-stage-2a] [--sd-threshold M]"
+            " [--stats] [--force] [--sd-threshold M]"
         )
         sys.exit(1)
 
@@ -601,7 +587,6 @@ def main():
                 p,
                 force=cli_args.force,
                 print_stats=cli_args.stats,
-                from_feasible=not cli_args.from_stage_2a,
                 sd_mask_threshold_m=cli_args.sd_threshold,
             )
         except Exception as e:

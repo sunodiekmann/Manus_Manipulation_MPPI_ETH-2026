@@ -23,8 +23,8 @@ from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
 from scripts.retargeting.tesollo_constants import TARGET_SCALE, FINGERS
 
 # Wrist-frame fingertip-target offsets. Kept zero here: the cube-relative
-# OFFLINE_TARGET_OFFSETS in retarget_sequence_cube_relative.py is calibrated
-# in cube frame and is not applicable to update_fingertip_targets_world_frame.
+# OFFLINE_TARGET_OFFSETS in tesollo_calibration.py is calibrated in cube
+# frame and is not applicable to update_fingertip_targets_world_frame.
 OFFLINE_TARGET_OFFSETS = {f: np.zeros(3) for f in FINGERS}
 from scripts.retargeting.tesollo_ik_runtime import (
     initialize_targets_from_configuration,
@@ -36,7 +36,7 @@ from scripts.retargeting.tesollo_ik_runtime import (
     update_wrist_task_target,
     solve_ik_step,
 )
-from scripts.retargeting.retarget_sequence_cube_relative import _apply_wrist_offset
+from scripts.retargeting.tesollo_calibration import apply_wrist_offset
 from scripts.retargeting.tesollo_mujoco_utils import (
     initialize_fingertip_target_mocaps,
     set_hand_base_pose,
@@ -109,7 +109,7 @@ def main():
                 T_world_from_wrist = None
                 if right_board_pose is not None:
                     T_world_from_board = pose_to_matrix(right_board_pose)
-                    T_world_from_wrist = _apply_wrist_offset(
+                    T_world_from_wrist = apply_wrist_offset(
                         T_world_from_board @ T_board_from_wrist_right, wrist_offset
                     )
 

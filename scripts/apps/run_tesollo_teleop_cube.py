@@ -1,8 +1,9 @@
-"""Live teleop using the cube-relative pipeline (mirrors offline retargeting).
+"""Live teleop using the cube-relative pipeline.
 
 Fingertip targets are placed in cube frame and transformed to world via the
-tracked cube pose — same as `retarget_sequence_cube_relative.py`. Reuses
-`_ik_frame` from the offline retargeter so behavior matches.
+tracked cube pose. Uses mink's gradient IK from `tesollo_mink_ik` (the
+offline retargeter switched to SPIDER-style equality IK in the rewrite;
+runtime teleop still uses mink for its latency/safety profile).
 
 Usage:
     python -m scripts.apps.run_tesollo_teleop_cube
@@ -29,25 +30,23 @@ from scripts.utils.config import (
 from scripts.utils.transforms import pose_to_matrix
 from scripts.utils.calibration_io import load_calibration_matrix
 
-from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
+from scripts.retargeting.tesollo_calibration import (
+    DEFAULT_WRIST_OFFSET, apply_wrist_offset,
+)
 from scripts.retargeting.tesollo_constants import TARGET_SCALE
 from scripts.retargeting.tesollo_ik_runtime import (
     initialize_targets_from_configuration,
+)
+from scripts.retargeting.tesollo_mink_ik import (
+    MODEL_PATH, _default_quats, ik_frame,
 )
 from scripts.retargeting.tesollo_mujoco_utils import (
     initialize_fingertip_target_mocaps,
     set_hand_base_pose,
 )
-from scripts.retargeting.retarget_sequence_cube_relative import (
-    MODEL_PATH,
-    _apply_wrist_offset,
-    _ik_frame,
-    _default_quats,
-)
+from scripts.retargeting.tesollo_task_builder import build_tesollo_task_bundle
 
 RIGHT_CALIB_JSON = "src/tag-pose-estimation/config/calibration_gloves/right_wrist2board_calibration.json"
-
-DEFAULT_WRIST_OFFSET = np.array([0.0043, 0.0064, -0.0268], dtype=float)
 
 
 def _parse_offset(argv):
@@ -140,13 +139,13 @@ def main():
                     rate.sleep()
                     continue
 
-                _ik_frame(
+                ik_frame(
                     model, data, task_bundle, default_quats,
                     fingertips_cube, T_world_cube, T_world_wrist, ergonomics,
                     scale=TARGET_SCALE, wrist_offset=wrist_offset,
                 )
 
-                T_world_robot_base = _apply_wrist_offset(T_world_wrist, wrist_offset)
+                T_world_robot_base = apply_wrist_offset(T_world_wrist, wrist_offset)
                 set_hand_base_pose(model, data, T_world_robot_base)
 
                 mujoco.mj_camlight(model, data)
