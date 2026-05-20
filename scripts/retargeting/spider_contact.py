@@ -532,6 +532,11 @@ def detect_contact_session(
         print(f"  manual constraints: {n_forbidden} forbid-contact frames, "
               f"{n_facebound} face-bound frames")
 
+    # (Snap is now handled at Stage 2 IK time in tesollo_target_mapping —
+    # interior targets are pushed to cube_half + 5 mm margin there. No
+    # spider_contact post-snap so we don't force exterior/hovering targets
+    # onto the surface.)
+
     np.savez_compressed(
         output_path,
         contact_mask=smoothed,

@@ -1,16 +1,25 @@
-"""Replay a dynamic-retargeted sequence in the MuJoCo viewer.
+"""Replay a retargeted sequence in the MuJoCo viewer.
 
-Plays back the qpos + cube trajectory produced by
-`scripts.retargeting.optimize_sequence_dynamic` against the same physics scene
-the MPPI ran in (`assets/output_mocap_physics.xml`).
+Two modes:
 
-Optionally also shows the kinematic reference cube as a translucent ghost so
-you can see how far the sim cube has drifted from the IK plan.
+  Default (Stage 3 dynamic): plays back the qpos + cube trajectory produced by
+  `scripts.retargeting.optimize_sequence_dynamic` against the same physics
+  scene the MPPI ran in (`assets/output_mocap_physics.xml`). Orange ghost
+  cube shows the MPC reference (cube_ref_used if present in the dynamic
+  npz, otherwise Stage 2's cube_pose_used).
+
+  --stage2: plays the Stage 2 kinematic IK output directly from
+  `retargeted_sequence.npz` (hand qpos + cube pose). With --cube-shift X Y Z
+  also draws a green ghost at the shifted cube position so you can sanity-
+  check the shift before running Stage 3.
 
 Usage:
     python -m scripts.retargeting.replay_dynamic recordings/<session>
     python -m scripts.retargeting.replay_dynamic recordings/<session> --speed 0.5
     python -m scripts.retargeting.replay_dynamic recordings/<session> --no-ref
+    python -m scripts.retargeting.replay_dynamic recordings/<session> --stage2
+    python -m scripts.retargeting.replay_dynamic recordings/<session> --stage2 \\
+        --cube-shift 0.02 0 -0.01
 """
 from __future__ import annotations
 
@@ -22,7 +31,12 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
+from scripts.retargeting.retarget_sequence_spider import shift_cube_in_wrist_frame
+
 PHYSICS_XML = Path(__file__).resolve().parents[2] / "assets" / "output_mocap_physics.xml"
+
+GHOST_REF_RGBA = (1.0, 0.7, 0.0, 0.6)   # orange — MPC reference
+GHOST_SHIFTED_RGBA = (0.2, 1.0, 0.3, 0.6)  # green — shifted cube preview
 
 
 def _apply_state(model, data, qpos_hand, cube_pose):
@@ -38,44 +52,94 @@ def _apply_state(model, data, qpos_hand, cube_pose):
     mujoco.mj_forward(model, data)
 
 
-def _draw_ghost_cube(scene, cube_pose_ref, half_size=0.035):
-    """Append a wireframe box at the reference cube pose to the user scene."""
+def _draw_ghost_cube(scene, cube_pose, rgba, half_size=0.035):
+    """Append a translucent box at `cube_pose` (xyz + wxyz) to the user scene."""
     if scene.ngeom >= scene.maxgeom:
         return
-    rgba = np.array([1.0, 0.7, 0.0, 0.6], dtype=np.float32)
     size = np.array([half_size, half_size, half_size], dtype=np.float64)
-    pos = np.asarray(cube_pose_ref[0:3], dtype=np.float64)
+    pos = np.asarray(cube_pose[0:3], dtype=np.float64)
     R = np.zeros(9, dtype=np.float64)
-    mujoco.mju_quat2Mat(R, np.asarray(cube_pose_ref[3:7], dtype=np.float64))
+    mujoco.mju_quat2Mat(R, np.asarray(cube_pose[3:7], dtype=np.float64))
     g = scene.geoms[scene.ngeom]
     mujoco.mjv_initGeom(g, type=mujoco.mjtGeom.mjGEOM_BOX,
-                        size=size, pos=pos, mat=R, rgba=rgba)
-    # wireframe-ish: turn off shading via a high transparency
+                        size=size, pos=pos, mat=R,
+                        rgba=np.asarray(rgba, dtype=np.float32))
     g.label = b""
     scene.ngeom += 1
 
 
-def replay(session_dir: Path, speed: float, show_ref: bool, loop: bool):
+def _load_stage2(session_dir: Path, cube_shift: np.ndarray | None):
+    """Returns (qpos, cube_play, cube_shifted_or_none, timeline).
+
+    cube_play is the *real* cube body's pose during playback (the Stage 2
+    cube — already shifted if Stage 2 was run with --cube-shift).
+    cube_shifted is an *additional* preview overlay: it asks "what would
+    Stage 2 place the cube at if I added THIS shift on top?", drawn as a
+    green ghost so you can eyeball direction/magnitude before re-running
+    Stage 2 with that shift baked in. None if no preview shift given.
+    """
+    ref_path = session_dir / "retargeted_sequence.npz"
+    if not ref_path.exists():
+        raise FileNotFoundError(f"missing {ref_path}")
+    rt = np.load(ref_path)
+    qpos = np.asarray(rt["retargeted_qpos"], dtype=float)
+    cube_play = np.asarray(rt["cube_pose_used"], dtype=float)
+    timeline = np.asarray(rt["timeline"], dtype=float)
+    cube_shifted = None
+    if cube_shift is not None and not np.allclose(cube_shift, 0.0):
+        proc_path = session_dir / "processed_sequence_with_proxy.npz"
+        if not proc_path.exists():
+            raise FileNotFoundError(
+                f"{proc_path.name} required for --cube-shift preview")
+        proc = np.load(proc_path, allow_pickle=True)
+        cube_shifted = shift_cube_in_wrist_frame(
+            cube_play, proc["right_wrist_world"], cube_shift)
+    return qpos, cube_play, cube_shifted, timeline
+
+
+def _load_stage3(session_dir: Path):
+    """Returns (qpos, cube_sim, cube_ref_or_none, timeline). Prefers
+    `cube_ref_used` from the dynamic npz (matches dynamic's frame count
+    even with --time-scale); falls back to Stage 2's cube_pose_used."""
     dyn_path = session_dir / "retargeted_sequence_dynamic.npz"
     if not dyn_path.exists():
         raise FileNotFoundError(f"missing {dyn_path}")
     dyn = np.load(dyn_path)
-    timeline = np.asarray(dyn["timeline"], dtype=float)
-    qpos_sim = np.asarray(dyn["retargeted_qpos"], dtype=float)
+    qpos = np.asarray(dyn["retargeted_qpos"], dtype=float)
     cube_sim = np.asarray(dyn["cube_traj"], dtype=float)
-    N = qpos_sim.shape[0]
-
-    cube_ref = None
-    if show_ref:
+    timeline = np.asarray(dyn["timeline"], dtype=float)
+    if "cube_ref_used" in dyn.files:
+        cube_ref = np.asarray(dyn["cube_ref_used"], dtype=float)
+    else:
         ref_path = session_dir / "retargeted_sequence.npz"
-        if ref_path.exists():
-            cube_ref = np.asarray(np.load(ref_path)["cube_pose_used"], dtype=float)
-        else:
-            print(f"  [warn] no Stage 2 reference at {ref_path.name}; ghost disabled")
+        cube_ref = (
+            np.asarray(np.load(ref_path)["cube_pose_used"], dtype=float)
+            if ref_path.exists() else None
+        )
+        # Length mismatch (e.g. dynamic was run with --time-scale): drop
+        # the ghost to avoid an index error.
+        if cube_ref is not None and cube_ref.shape[0] != qpos.shape[0]:
+            print(f"  [warn] Stage 2 ref has {cube_ref.shape[0]} frames vs "
+                  f"dynamic's {qpos.shape[0]}; ghost disabled. Re-run "
+                  f"optimize_sequence_dynamic to save cube_ref_used.")
+            cube_ref = None
+    return qpos, cube_sim, cube_ref, timeline
 
-    rew_max = dyn.get("rew_max")
-    rew_mean = dyn.get("rew_mean")
 
+def replay(session_dir: Path, *, speed: float, show_ref: bool, loop: bool,
+           stage2: bool, cube_shift: np.ndarray | None):
+    if stage2:
+        qpos, cube_play, cube_shifted, timeline = _load_stage2(session_dir, cube_shift)
+        cube_ref_ghost = None  # in stage2 mode, "ref" overlay would equal cube_play
+        mode_label = f"stage2  shift={cube_shift if cube_shift is not None else 'none'}"
+    else:
+        qpos, cube_play, cube_ref_ghost, timeline = _load_stage3(session_dir)
+        if not show_ref:
+            cube_ref_ghost = None
+        cube_shifted = None
+        mode_label = "stage3 (dynamic)"
+
+    N = qpos.shape[0]
     model = mujoco.MjModel.from_xml_path(str(PHYSICS_XML))
     data = mujoco.MjData(model)
 
@@ -83,8 +147,12 @@ def replay(session_dir: Path, speed: float, show_ref: bool, loop: bool):
     sleep_dt = dt_per_frame / max(speed, 1e-6)
 
     print(f"  replaying {N} frames  dt={dt_per_frame*1000:.1f} ms  ×{speed}"
-          f"  ghost-ref={show_ref and cube_ref is not None}  loop={loop}")
-    print(f"  session: {session_dir.name}")
+          f"  loop={loop}")
+    print(f"  session: {session_dir.name}  mode: {mode_label}")
+    if cube_shifted is not None:
+        print(f"  green ghost = shifted cube target  orange ghost = (n/a in stage2)")
+    elif cube_ref_ghost is not None:
+        print(f"  orange ghost = MPC reference cube")
 
     with mujoco.viewer.launch_passive(
         model=model, data=data, show_left_ui=False, show_right_ui=False,
@@ -95,16 +163,14 @@ def replay(session_dir: Path, speed: float, show_ref: bool, loop: bool):
                 if not viewer.is_running():
                     break
                 t0 = time.perf_counter()
-                _apply_state(model, data, qpos_sim[t], cube_sim[t])
+                _apply_state(model, data, qpos[t], cube_play[t])
 
-                if cube_ref is not None:
-                    with viewer.lock():
-                        # reset user-scene geoms each frame
-                        viewer.user_scn.ngeom = 0
-                        _draw_ghost_cube(viewer.user_scn, cube_ref[t])
-
-                if rew_max is not None:
-                    pass  # could show on-screen if desired
+                with viewer.lock():
+                    viewer.user_scn.ngeom = 0
+                    if cube_ref_ghost is not None:
+                        _draw_ghost_cube(viewer.user_scn, cube_ref_ghost[t], GHOST_REF_RGBA)
+                    if cube_shifted is not None:
+                        _draw_ghost_cube(viewer.user_scn, cube_shifted[t], GHOST_SHIFTED_RGBA)
 
                 mujoco.mj_camlight(model, data)
                 viewer.sync()
@@ -121,11 +187,26 @@ def main():
     p.add_argument("session_dir", type=Path)
     p.add_argument("--speed", type=float, default=1.0)
     p.add_argument("--no-ref", dest="show_ref", action="store_false",
-                   help="hide the ghost reference cube")
+                   help="hide the orange ghost reference cube (stage3 mode)")
     p.add_argument("--once", dest="loop", action="store_false",
                    help="play through once instead of looping")
+    p.add_argument("--stage2", action="store_true",
+                   help="replay the Stage 2 kinematic IK output "
+                        "(retargeted_sequence.npz) instead of the dynamic npz")
+    p.add_argument("--cube-shift", type=float, nargs=3, default=None,
+                   metavar=("X", "Y", "Z"),
+                   help="wrist-frame shift (m) to preview as a green ghost "
+                        "over the original cube. Same semantics as the "
+                        "--cube-shift flag of optimize_sequence_dynamic. "
+                        "Only meaningful with --stage2.")
     args = p.parse_args()
-    replay(args.session_dir, speed=args.speed, show_ref=args.show_ref, loop=args.loop)
+    shift = (np.asarray(args.cube_shift, dtype=float)
+             if args.cube_shift is not None else None)
+    if shift is not None and not args.stage2:
+        print("  [note] --cube-shift ignored without --stage2")
+        shift = None
+    replay(args.session_dir, speed=args.speed, show_ref=args.show_ref,
+           loop=args.loop, stage2=args.stage2, cube_shift=shift)
 
 
 if __name__ == "__main__":

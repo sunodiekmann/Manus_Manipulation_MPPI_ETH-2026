@@ -1,15 +1,11 @@
 """Stage 3 — Dynamic retargeting via SPIDER-style sampling MPC.
 
 Reads Stage 2 (`retargeted_sequence.npz`) + Stage 2.5 contact targets
-(`contact_sequence.npz`) and produces a dynamically feasible trajectory by
-rolling MPPI in the *dyn* physics scene from `build_ik_scene.compile_dyn`:
-cube freejoint replaced by 3 slide + 3 hinge joints + position actuators
-("virtual stick"), so MPC can supply gradient-rich object commands that
-fade as the schedule progresses and fingers learn to hold the cube alone.
+(`contact_sequence.npz`) and produces a dynamically feasible trajectory
+by rolling MPPI in the base physics scene (cube as a real freejoint,
+no virtual stick — fingers must grip and rotate the cube under physics).
 
-Action layout (per step):
-    [20 finger ctrls, 3 wrist axis-angle delta, 3 obj_pos ctrl, 3 obj_rot ctrl]
-
+Action layout (per step): [20 finger ctrls, 3 wrist axis-angle delta].
 Wrist policy: position locked to ref; orientation = ref ⊗ exp(action delta).
 
 Inputs (per session):
@@ -20,12 +16,12 @@ Output:
     recordings/<session>/retargeted_sequence_dynamic.npz
         timeline (N,)
         retargeted_qpos (N, 27)        — sim hand qpos after each MPC tick
-        cube_traj (N, 7)               — sim cube pose7 (pos+wxyz)
+        cube_traj (N, 7)               — sim cube pose7 (pos + wxyz)
         ctrl_traj (N, 20)              — applied finger controls
         wrist_delta_traj (N, 3)        — applied wrist axis-angle delta
-        obj_ctrl_traj (N, 6)           — applied obj pos+rot ctrls
-        obj_decay_traj (N,)            — virtual-stick gain factor each tick
         rew_max, rew_mean              — MPPI diagnostics per tick
+        pos_err_history, rot_err_history, iter_improvement_history
+        term_names, term_means_history — per-term reward diagnostics
 
 Usage:
     python -m scripts.retargeting.optimize_sequence_dynamic recordings/<session>
@@ -43,13 +39,10 @@ from scripts.retargeting.dynamic_retargeting.cpu_env import (
     CpuEnv,
     N_ACTION,
     N_FINGER_CTRL,
-    N_OBJ_CTRL,
-    N_OBJ_POS_CTRL,
     N_WRIST_DELTA,
-    cube_qpos_from_pose7,
 )
 from scripts.retargeting.dynamic_retargeting.mppi import MPPIConfig, optimize_step
-from scripts.retargeting.dynamic_retargeting.reward import RewardWeights
+from scripts.retargeting.dynamic_retargeting.reward import RewardWeights, TERM_NAMES
 
 
 def _build_env(backend: str, num_samples: int):
@@ -69,37 +62,68 @@ def _pad_reference(arr: np.ndarray, total_len: int) -> np.ndarray:
     return np.concatenate([arr, pad], axis=0)
 
 
-def _build_obj_baseline(cube_ref_pose7: np.ndarray) -> np.ndarray:
-    """(N, 7) ref cube pose7 → (N, 6) cube qpos in dyn-scene coords (Euler XYZ)."""
-    out = np.zeros((cube_ref_pose7.shape[0], N_OBJ_CTRL), dtype=np.float64)
-    for i in range(cube_ref_pose7.shape[0]):
-        out[i] = cube_qpos_from_pose7(cube_ref_pose7[i])
-    return out
+def _resample_reference(
+    K: int,
+    qpos_ref: np.ndarray,                  # (N, 27) wrist freejoint + 20 fingers
+    cube_ref: np.ndarray,                  # (N, 7)  [x,y,z, qw,qx,qy,qz]
+    contact_target: np.ndarray | None,     # (N, 5, 3) cube-frame, NaN allowed
+    timeline: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
+    """Insert K-1 interpolated frames between each pair of input frames so
+    the per-tick reference delta is K× smaller (i.e. slower reference
+    motion at the same sim cadence). The total task duration grows K×.
 
-
-
-
-def _shift_cube_reference(cube_ref: np.ndarray, wrist_T: np.ndarray,
-                          shift_wrist: np.ndarray) -> np.ndarray:
-    """Translate the cube reference by `shift_wrist` (wrist-frame, metres)
-    at every frame. Keeps cube orientation untouched. Used to push the
-    cube away from the palm so MPPI doesn't have to fight a geometry where
-    the reference cube grazes the hand interior (cube_pitch case).
-
-    `wrist_T` is the (N, 27) hand qpos; first 7 entries are the freejoint
-    pose (pos + wxyz quat). Result is a copy.
+    Quaternions use SLERP; everything else linear. Contact-target entries
+    that have NaN at either endpoint of an interval stay NaN in the
+    interpolated region.
     """
-    if np.allclose(shift_wrist, 0.0):
-        return cube_ref
-    out = cube_ref.copy()
-    from scipy.spatial.transform import Rotation as R
-    for i in range(cube_ref.shape[0]):
-        wrist_quat_wxyz = wrist_T[i, 3:7]
-        wrist_quat_xyzw = np.array([wrist_quat_wxyz[1], wrist_quat_wxyz[2],
-                                    wrist_quat_wxyz[3], wrist_quat_wxyz[0]])
-        R_world_wrist = R.from_quat(wrist_quat_xyzw).as_matrix()
-        out[i, :3] = cube_ref[i, :3] + R_world_wrist @ shift_wrist
-    return out
+    K = int(K)
+    if K <= 1:
+        return qpos_ref, cube_ref, contact_target, timeline
+    from scipy.spatial.transform import Rotation as R, Slerp
+    N = qpos_ref.shape[0]
+    M = (N - 1) * K + 1
+    t_in = np.arange(N, dtype=float)
+    t_out = np.linspace(0.0, N - 1, M)
+
+    new_qpos = np.zeros((M, 27), dtype=np.float64)
+    for j in (0, 1, 2, *range(7, 27)):
+        new_qpos[:, j] = np.interp(t_out, t_in, qpos_ref[:, j])
+    wrist_xyzw = qpos_ref[:, [4, 5, 6, 3]]
+    wq_out_xyzw = Slerp(t_in, R.from_quat(wrist_xyzw))(t_out).as_quat()
+    new_qpos[:, 3] = wq_out_xyzw[:, 3]
+    new_qpos[:, 4:7] = wq_out_xyzw[:, :3]
+
+    new_cube = np.zeros((M, 7), dtype=np.float64)
+    for j in range(3):
+        new_cube[:, j] = np.interp(t_out, t_in, cube_ref[:, j])
+    cube_xyzw = cube_ref[:, [4, 5, 6, 3]]
+    cq_out_xyzw = Slerp(t_in, R.from_quat(cube_xyzw))(t_out).as_quat()
+    new_cube[:, 3] = cq_out_xyzw[:, 3]
+    new_cube[:, 4:7] = cq_out_xyzw[:, :3]
+
+    new_contact = None
+    if contact_target is not None:
+        F = contact_target.shape[1]
+        new_contact = np.full((M, F, 3), np.nan, dtype=np.float64)
+        for f in range(F):
+            for c in range(3):
+                vals = contact_target[:, f, c]
+                valid = ~np.isnan(vals)
+                for i in range(N - 1):
+                    if not (valid[i] and valid[i + 1]):
+                        continue
+                    sel = (t_out >= t_in[i]) & (t_out <= t_in[i + 1])
+                    alpha = (t_out[sel] - t_in[i]) / (t_in[i + 1] - t_in[i])
+                    new_contact[sel, f, c] = (1 - alpha) * vals[i] + alpha * vals[i + 1]
+                if valid[0]:
+                    new_contact[0, f, c] = vals[0]
+                if valid[-1]:
+                    new_contact[-1, f, c] = vals[-1]
+
+    dt_in = float(np.diff(timeline).mean()) if N > 1 else 1.0
+    new_timeline = timeline[0] + dt_in * np.arange(M)
+    return new_qpos, new_cube, new_contact, new_timeline
 
 
 def run_session(
@@ -108,7 +132,8 @@ def run_session(
     warmup_steps: int = 50, warmup_closure: float = 0.0,
     loop_closure: float = 0.0,
     backend: str = "cpu",
-    cube_shift: np.ndarray | None = None,
+    time_scale: int = 1,
+    max_ticks: int = 0,
     stale_rotation_window_s: float = 0.0,
     stale_rotation_deg: float = 5.0,
 ) -> None:
@@ -131,22 +156,28 @@ def run_session(
     timeline = np.asarray(rt["timeline"], dtype=float)
     qpos_ref = np.asarray(rt["retargeted_qpos"], dtype=float)        # (N, 27)
     cube_ref = np.asarray(rt["cube_pose_used"], dtype=float)         # (N, 7)
-
-    if cube_shift is not None and not np.allclose(cube_shift, 0.0):
-        cube_ref = _shift_cube_reference(cube_ref, qpos_ref, cube_shift)
-        print(f"  cube_shift (wrist frame, mm): "
-              f"[{cube_shift[0]*1000:+.1f}, {cube_shift[1]*1000:+.1f}, {cube_shift[2]*1000:+.1f}]")
+    if "cube_shift" in rt.files:
+        cs = np.asarray(rt["cube_shift"], dtype=float)
+        print(f"  Stage 2 baked-in cube_shift (mm): "
+              f"[{cs[0]*1000:+.1f}, {cs[1]*1000:+.1f}, {cs[2]*1000:+.1f}]")
     cm = np.load(contact_path)
     contact_target_per_frame = (
         np.asarray(cm["contact_target_per_frame"], dtype=float)
         if "contact_target_per_frame" in cm.files else None
     )
 
+    if time_scale > 1:
+        N_orig = qpos_ref.shape[0]
+        qpos_ref, cube_ref, contact_target_per_frame, timeline = _resample_reference(
+            time_scale, qpos_ref, cube_ref, contact_target_per_frame, timeline)
+        print(f"  time-scale: {time_scale}× (reference upsampled "
+              f"{N_orig} → {qpos_ref.shape[0]} frames; per-tick Δref / {time_scale}, "
+              f"total task time × {time_scale})")
+
     N = qpos_ref.shape[0]
     H = cfg.horizon_steps
     qpos_ref_padded = _pad_reference(qpos_ref, N + H)
     cube_ref_padded = _pad_reference(cube_ref, N + H)
-    obj_baseline_padded = _build_obj_baseline(cube_ref_padded)       # (N+H, 6)
     if contact_target_per_frame is not None:
         last = contact_target_per_frame[-1:].copy()
         last[:] = np.nan
@@ -159,10 +190,7 @@ def run_session(
     print(f"  sequence: {N} ref ticks  ({timeline[-1]-timeline[0]:.1f}s)")
     print(f"  MPPI: N={cfg.num_samples}, H={cfg.horizon_steps}, iters={cfg.max_iters},"
           f" substeps={cfg.n_substeps}")
-    print(f"  noise std: finger={cfg.finger_noise_std}  wrist={cfg.wrist_noise_std}"
-          f"  obj_pos={cfg.obj_pos_noise_std}  obj_rot={cfg.obj_rot_noise_std}")
-    print(f"  virtual stick: iter_start={cfg.iter_stick_start}  iter_end={cfg.iter_stick_end}  "
-          f"(annealed across {cfg.max_iters} MPPI iters; world step always stick=0)")
+    print(f"  noise std: finger={cfg.finger_noise_std}  wrist={cfg.wrist_noise_std}")
 
     print(f"  backend: {backend}")
     env = _build_env(backend, cfg.num_samples)
@@ -170,25 +198,18 @@ def run_session(
     if loop_closure > 0.0:
         env.set_closure_bias(loop_closure)
 
-    # Virtual-stick warmup: stick is fully on, fingers settle into a grip
-    # before MPC takes over.
-    env.set_obj_decay(1.0)
+    # Kinematic-pin warmup: pin cube at ref[0], step physics so fingers
+    # settle into a grip. After this the cube is released and runs free.
     if warmup_steps > 0:
-        warmup_action = np.zeros(N_ACTION, dtype=np.float64)
-        warmup_action[:N_FINGER_CTRL] = qpos_ref[0, 7:27]
-        if warmup_closure > 0.0:
-            warmup_action[:N_FINGER_CTRL] += (
-                warmup_closure * env._flexion_closure_direction())
-        warmup_action[N_FINGER_CTRL : N_FINGER_CTRL + N_WRIST_DELTA] = 0.0
-        warmup_action[N_FINGER_CTRL + N_WRIST_DELTA:] = obj_baseline_padded[0]
-        for _ in range(warmup_steps):
-            env.step_world(
-                action=warmup_action,
-                ref_wrist_pos=qpos_ref[0, 0:3],
-                ref_wrist_quat=qpos_ref[0, 3:7],
-                n_substeps=1,
-            )
-        print(f"  warmup grasp: {warmup_steps} substeps with stick=1.0  "
+        env.warmup_grasp(
+            cube_pose7=cube_ref[0],
+            finger_ctrl=qpos_ref[0, 7:27],
+            ref_wrist_pos=qpos_ref[0, 0:3],
+            ref_wrist_quat=qpos_ref[0, 3:7],
+            n_steps=warmup_steps,
+            closure_bias=warmup_closure,
+        )
+        print(f"  warmup grasp: {warmup_steps} substeps with cube pinned  "
               f"closure_bias={warmup_closure:.3f} rad")
 
     rng = np.random.default_rng(seed)
@@ -197,24 +218,28 @@ def run_session(
     cube_traj = np.zeros((N, 7), dtype=np.float64)
     ctrl_traj = np.zeros((N, N_FINGER_CTRL), dtype=np.float64)
     wrist_delta_traj = np.zeros((N, N_WRIST_DELTA), dtype=np.float64)
-    obj_ctrl_traj = np.zeros((N, N_OBJ_CTRL), dtype=np.float64)
-    obj_decay_traj = np.zeros(N, dtype=np.float64)  # always 0 now (kept for back-compat)
     rew_max_log, rew_mean_log = [], []
+    pos_err_history = np.zeros(N, dtype=np.float64)
+    rot_err_history = np.zeros(N, dtype=np.float64)
+    iter_improvement_history = np.zeros(N, dtype=np.float64)
+    term_means_history = np.zeros((N, len(TERM_NAMES)), dtype=np.float64)
 
-    # Initialise the plan: finger ctrls = IK ref, wrist delta = 0, obj ctrl = baseline.
+    # Initial plan: finger ctrls = IK ref, wrist delta = 0.
     plan = np.zeros((H, N_ACTION), dtype=np.float64)
     plan[:, :N_FINGER_CTRL] = qpos_ref_padded[:H, 7:27]
     plan[:, N_FINGER_CTRL : N_FINGER_CTRL + N_WRIST_DELTA] = 0.0
-    plan[:, N_FINGER_CTRL + N_WRIST_DELTA:] = obj_baseline_padded[:H]
+
+    N_run = N if max_ticks <= 0 else min(N, max_ticks)
+    if N_run < N:
+        print(f"  capped to {N_run}/{N} MPC ticks (--max-ticks)")
 
     t_start = time.perf_counter()
-    for t in range(N):
+    for t in range(N_run):
         ref_qpos_h = qpos_ref_padded[t : t + H]
         ref_cube_pos_h = cube_ref_padded[t : t + H, 0:3]
         ref_cube_quat_h = cube_ref_padded[t : t + H, 3:7]
         ref_wrist_pos_h = qpos_ref_padded[t : t + H, 0:3]
         ref_wrist_quat_h = qpos_ref_padded[t : t + H, 3:7]
-        obj_baseline_h = obj_baseline_padded[t : t + H]
         contact_target_h = (
             contact_target_per_frame_padded[t : t + H]
             if contact_target_per_frame_padded is not None else None
@@ -223,7 +248,6 @@ def run_session(
         plan, info = optimize_step(
             env=env,
             plan=plan,
-            obj_baseline=obj_baseline_h,
             ref_qpos=ref_qpos_h,
             ref_cube_pos=ref_cube_pos_h,
             ref_cube_quat=ref_cube_quat_h,
@@ -234,9 +258,6 @@ def run_session(
             rng=rng,
         )
 
-        # World step always with stick OFF — the stick is an optimizer
-        # warm-start only, not real physics aid.
-        env.set_obj_decay(0.0)
         action = plan[0]
         env.step_world(
             action=action,
@@ -249,32 +270,41 @@ def run_session(
         cube_traj[t] = env.get_world_cube_pose7()
         ctrl_traj[t] = action[:N_FINGER_CTRL]
         wrist_delta_traj[t] = action[N_FINGER_CTRL : N_FINGER_CTRL + N_WRIST_DELTA]
-        obj_ctrl_traj[t] = action[N_FINGER_CTRL + N_WRIST_DELTA:]
-        obj_decay_traj[t] = 0.0
         rew_max_log.append(info["rew_max"])
         rew_mean_log.append(info["rew_mean"])
 
-        # Slide horizon: drop applied step, append next IK ref + obj baseline tail.
+        sim_cube_pose = cube_traj[t]
+        ref_cube_pose_now = cube_ref_padded[t]
+        pos_err_history[t] = float(np.linalg.norm(
+            sim_cube_pose[0:3] - ref_cube_pose_now[0:3]))
+        dot = float(abs(np.dot(sim_cube_pose[3:7], ref_cube_pose_now[3:7])))
+        rot_err_history[t] = float(2.0 * np.arccos(min(1.0, max(-1.0, dot))))
+        iter_improvement_history[t] = (
+            info["rew_max"][-1] - info["rew_max"][0])
+        for ti, k in enumerate(TERM_NAMES):
+            term_means_history[t, ti] = info["terms"][k][-1]
+
+        # Slide horizon: drop applied step, append next IK ref tail.
         plan = np.concatenate(
             [plan[1:], np.zeros((1, N_ACTION), dtype=np.float64)], axis=0)
         plan[-1, :N_FINGER_CTRL] = qpos_ref_padded[t + H, 7:27]
         plan[-1, N_FINGER_CTRL : N_FINGER_CTRL + N_WRIST_DELTA] = 0.0
-        plan[-1, N_FINGER_CTRL + N_WRIST_DELTA:] = obj_baseline_padded[t + H]
 
         if t % 10 == 0:
             elapsed = time.perf_counter() - t_start
             rate = (t + 1) / elapsed
-            eta = (N - t - 1) / rate if rate > 0 else 0.0
-            print(f"  t={t:4d}/{N}  "
-                  f"rew[max]={info['rew_max'][-1]:+8.2f} "
-                  f"rew[mean]={info['rew_mean'][-1]:+8.2f}  "
-                  f"frac_term[final]={info['frac_terminated'][-1]:.2f}  "
-                  f"rate={rate:.2f} ticks/s  ETA={eta:.0f}s")
+            eta = (N_run - t - 1) / rate if rate > 0 else 0.0
+            print(f"  t={t:4d}/{N}  rew={info['rew_max'][-1]:+7.2f}"
+                  f" (improv {iter_improvement_history[t]:+5.2f})  "
+                  f"pos={pos_err_history[t]*1000:5.1f}mm  "
+                  f"rot={np.degrees(rot_err_history[t]):5.1f}°  "
+                  f"frac_term={info['frac_terminated'][-1]:.2f}  "
+                  f"rate={rate:.2f} t/s  ETA={eta:.0f}s")
+            terms_str = "  ".join(
+                f"{k}={info['terms'][k][-1]:+6.2f}" for k in TERM_NAMES)
+            print(f"           terms: {terms_str}")
 
-        # Stale-rotation early stop: if the *sim* cube has rotated less than
-        # `stale_rotation_deg` over the last `stale_rotation_window_s` of
-        # ticks AND the *reference* is still rotating, the MPC is stuck and
-        # further compute is wasted. Disabled when window_s == 0.
+        # Stale-rotation early stop.
         if stale_rotation_window_s > 0:
             dt = float(np.diff(timeline).mean()) if len(timeline) > 1 else 0.05
             win = max(2, int(stale_rotation_window_s / dt))
@@ -295,16 +325,25 @@ def run_session(
                     qpos_traj = qpos_traj[: t + 1]
                     ctrl_traj = ctrl_traj[: t + 1]
                     wrist_delta_traj = wrist_delta_traj[: t + 1]
-                    obj_ctrl_traj = obj_ctrl_traj[: t + 1]
-                    obj_decay_traj = obj_decay_traj[: t + 1]
                     timeline = timeline[: t + 1]
                     break
 
     elapsed = time.perf_counter() - t_start
     print(f"  Done in {elapsed:.1f}s ({len(timeline)/elapsed:.2f} ticks/s).")
 
-    rew_max_log = rew_max_log[: len(timeline)]
-    rew_mean_log = rew_mean_log[: len(timeline)]
+    K = min(len(timeline), N_run, len(rew_max_log))
+    timeline = timeline[:K]
+    qpos_traj = qpos_traj[:K]
+    cube_traj = cube_traj[:K]
+    ctrl_traj = ctrl_traj[:K]
+    wrist_delta_traj = wrist_delta_traj[:K]
+    rew_max_log = rew_max_log[:K]
+    rew_mean_log = rew_mean_log[:K]
+    # Save the (post-resample) reference cube + hand that MPC was actually
+    # optimizing against. Replay reads these for the ghost overlay so the
+    # frame count matches the dynamic trajectory even with --time-scale.
+    cube_ref_used = cube_ref_padded[:K].copy()
+    qpos_ref_used = qpos_ref_padded[:K].copy()
     np.savez_compressed(
         out_path,
         timeline=timeline,
@@ -312,11 +351,26 @@ def run_session(
         cube_traj=cube_traj,
         ctrl_traj=ctrl_traj,
         wrist_delta_traj=wrist_delta_traj,
-        obj_ctrl_traj=obj_ctrl_traj,
-        obj_decay_traj=obj_decay_traj,
         rew_max=np.asarray(rew_max_log),
         rew_mean=np.asarray(rew_mean_log),
+        pos_err_history=pos_err_history[:K],
+        rot_err_history=rot_err_history[:K],
+        iter_improvement_history=iter_improvement_history[:K],
+        term_names=np.asarray(list(TERM_NAMES)),
+        term_means_history=term_means_history[:K],
+        cube_ref_used=cube_ref_used,
+        qpos_ref_used=qpos_ref_used,
     )
+    print(f"  ── error summary ──")
+    print(f"  cube pos err (mm):  mean={pos_err_history[:K].mean()*1000:5.1f}  "
+          f"max={pos_err_history[:K].max()*1000:5.1f}")
+    print(f"  cube rot err (°):   mean={np.degrees(rot_err_history[:K]).mean():5.1f}  "
+          f"max={np.degrees(rot_err_history[:K]).max():5.1f}")
+    print(f"  iter improvement:   mean={iter_improvement_history[:K].mean():+5.2f}  "
+          f"max={iter_improvement_history[:K].max():+5.2f}")
+    print(f"  mean per-term reward across ticks (more-negative = bigger penalty):")
+    for ti, k in enumerate(TERM_NAMES):
+        print(f"    {k:12s} {term_means_history[:K, ti].mean():+7.3f}")
     print(f"  Saved: {out_path}")
 
 
@@ -358,58 +412,46 @@ def main():
     parser.add_argument("--w-wrist-delta", type=float, default=None)
     parser.add_argument("--w-qvel", type=float, default=None,
                         help="Velocity penalty weight (per rad/s, m/s). "
-                             "Encourages stable equilibrium states. Default 0.05.")
+                             "Encourages stable equilibrium states. Default 0.005.")
     parser.add_argument("--terminal-scale", type=float, default=None,
                         help="Multiplier on the LAST horizon-step reward. "
-                             "Forces MPC to care about where the cube ends up "
-                             "at horizon-end (fixes myopic drift). Default 10.")
+                             "Default 3.0.")
     parser.add_argument("--cube-pos-deadband", type=float, default=0.0,
                         help="Wrist-frame radius (m) inside which cube_pos "
-                             "error is zero. Lets MPPI choose any cube pose "
-                             "within ±this from the wrist-relative reference, "
-                             "then pins it there. Recommended ~0.02 for "
-                             "cube_pitch.")
+                             "error is zero. Recommended ~0.02 for cube_pitch.")
+    parser.add_argument("--cube-pos-wall-start", type=float, default=0.0,
+                        help="Distance past the deadband (m) where the "
+                             "quadratic wall kicks in. e.g. 0.01 = 10 mm "
+                             "linear band before the wall. Default 0.")
+    parser.add_argument("--cube-pos-wall-scale", type=float, default=0.0,
+                        help="Quadratic penalty weight (per m²) past the "
+                             "wall threshold. e.g. 100 makes a 70 mm wall "
+                             "excess contribute ~0.49 per step vs 0.07 "
+                             "linear. Default 0 (no wall).")
     parser.add_argument("--finger-noise", type=float, default=None)
     parser.add_argument("--wrist-noise", type=float, default=None)
-    parser.add_argument("--obj-pos-noise", type=float, default=None)
-    parser.add_argument("--obj-rot-noise", type=float, default=None)
     parser.add_argument("--warmup-steps", type=int, default=50,
-                        help="Virtual-stick warmup substeps before MPPI starts.")
+                        help="Kinematic-pin warmup substeps before MPPI starts.")
     parser.add_argument("--warmup-closure", type=float, default=0.0)
     parser.add_argument("--loop-closure", type=float, default=0.0)
-    parser.add_argument("--iter-stick-start", type=float, default=1.0,
-                        help="Virtual-stick gain at MPPI iter 0 (warm-start). "
-                             "1.0 = full support, 0.0 = no stick.")
-    parser.add_argument("--iter-stick-end", type=float, default=0.0,
-                        help="Virtual-stick gain at MPPI converged iter. "
-                             "Should be 0.0 unless you want a residual stick.")
-    parser.add_argument("--iter-stick-schedule", default="warm_then_off",
-                        choices=["linear", "warm_then_off"],
-                        help="`warm_then_off`: iter 0 = start, iter >=1 = end "
-                             "(most iters are pure refinement). `linear`: "
-                             "linearly anneal start->end across all iters.")
     parser.add_argument("--drop-threshold", type=float, default=0.10,
                         help="Cube pos-error threshold (m) for resample-on-drop.")
     parser.add_argument("--backend", default="cpu", choices=["cpu", "mjwp"],
-                        help="Rollout backend: cpu (sequential CPU MuJoCo) or "
-                             "mjwp (NVIDIA Warp GPU, supports large N).")
-    parser.add_argument("--cube-shift", type=float, nargs=3, default=None,
-                        metavar=("X", "Y", "Z"),
-                        help="Shift the cube reference (and starting pose) by "
-                             "this 3-vector in wrist frame, metres. Use to give "
-                             "the cube room from the palm so MPPI doesn't have "
-                             "to fight a tight geometry. Doesn't affect "
-                             "fingertip contact targets (cube-frame).")
+                        help="Rollout backend: cpu or mjwp (NVIDIA Warp GPU).")
+    parser.add_argument("--time-scale", type=int, default=1,
+                        help="Integer reference-trajectory upsampling.")
+    parser.add_argument("--max-ticks", type=int, default=0,
+                        help="Cap MPC at this many ticks. 0 = full sequence.")
     parser.add_argument("--stale-rotation-window", type=float, default=0.0,
                         help="Early-stop if cube rotates less than "
-                             "--stale-rotation-deg over this many seconds while "
-                             "the reference is still rotating. 0 disables.")
-    parser.add_argument("--stale-rotation-deg", type=float, default=5.0,
-                        help="Threshold (deg) for stale-rotation check.")
+                             "--stale-rotation-deg over this many seconds.")
+    parser.add_argument("--stale-rotation-deg", type=float, default=5.0)
     args = parser.parse_args()
 
     weights = _build_weights(args)
     weights.cube_pos_deadband_m = float(args.cube_pos_deadband)
+    weights.cube_pos_wall_start_m = float(args.cube_pos_wall_start)
+    weights.cube_pos_wall_scale = float(args.cube_pos_wall_scale)
     cfg = MPPIConfig(
         num_samples=args.num_samples,
         horizon_steps=args.horizon,
@@ -417,14 +459,9 @@ def main():
         n_substeps=args.substeps,
         weights=weights,
         drop_threshold_m=args.drop_threshold,
-        iter_stick_start=args.iter_stick_start,
-        iter_stick_end=args.iter_stick_end,
-        iter_stick_schedule=args.iter_stick_schedule,
     )
     if args.finger_noise is not None: cfg.finger_noise_std = args.finger_noise
     if args.wrist_noise is not None:  cfg.wrist_noise_std = args.wrist_noise
-    if args.obj_pos_noise is not None: cfg.obj_pos_noise_std = args.obj_pos_noise
-    if args.obj_rot_noise is not None: cfg.obj_rot_noise_std = args.obj_rot_noise
 
     print(f"  weights: cube_pos={weights.cube_pos}  cube_quat={weights.cube_quat}"
           f"  finger_qpos={weights.finger_qpos}  contact={weights.contact}"
@@ -438,8 +475,8 @@ def main():
             warmup_closure=args.warmup_closure,
             loop_closure=args.loop_closure,
             backend=args.backend,
-            cube_shift=(np.asarray(args.cube_shift, dtype=float)
-                        if args.cube_shift is not None else None),
+            time_scale=args.time_scale,
+            max_ticks=args.max_ticks,
             stale_rotation_window_s=args.stale_rotation_window,
             stale_rotation_deg=args.stale_rotation_deg,
         )

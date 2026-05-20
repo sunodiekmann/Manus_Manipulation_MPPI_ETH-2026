@@ -7,12 +7,10 @@ augments it programmatically with:
     and equality springs (CONNECT for fingertips, WELD for palm and cube)
     that pull the hand toward the targets. Mirrors SPIDER's IK setup.
 
-  * `build_dyn_spec(...)`: the cube freejoint is replaced by 3 slide + 3 hinge
-    joints with zero-kp position actuators ("virtual stick"); the MPC drives
-    these via the action vector. No equality constraints.
-
-Both return a compiled (model, data) pair. Pass `dump_to` to also write the
-generated XML to disk for inspection.
+  * `compile_dyn(...)`: returns the base scene unchanged. The cube keeps its
+    natural freejoint — no replacement joints, no actuators, no virtual
+    stick. Stage 3 MPC drives only the fingers + a wrist-orientation delta
+    and lets physics handle the cube freely.
 """
 
 from __future__ import annotations
@@ -205,98 +203,16 @@ def compile_ik(*, base_xml: Path | str = BASE_XML, sim_dt: float = 0.01,
     return model, mujoco.MjData(model)
 
 
-CUBE_OBJ_POS_KP_MAX = 30.0   # N/m       virtual-stick max linear stiffness
-CUBE_OBJ_POS_KD_MAX = 2.0    # N·s/m
-CUBE_OBJ_ROT_KP_MAX = 0.5    # N·m/rad   virtual-stick max rotational stiffness
-CUBE_OBJ_ROT_KD_MAX = 0.05   # N·m·s/rad
-
-
-def build_dyn_spec(*, base_xml: Path | str = BASE_XML,
-                   cube_armature: float = 1e-4,
-                   cube_frictionloss: float = 1e-4) -> mujoco.MjSpec:
-    """Replace the cube freejoint with 3 slide + 3 hinge joints and add
-    position-style actuators on each. The actuators are configured so
-    `output_force = gain * (ctrl - qpos) - bias_v * qvel`, with `gain` and
-    `bias_v` settable at runtime via `scale_obj_actuators` for the
-    virtual-stick decay schedule. MPC supplies `ctrl` = desired cube qpos
-    (Euler 3+3) per horizon step.
-    """
-    spec = mujoco.MjSpec.from_file(str(base_xml))
-
-    cube = spec.body(CUBE_BODY)
-    for j in list(cube.joints):
-        if j.name == "cube_freejoint":
-            spec.delete(j)
-            break
-
-    axis_table = (("x", [1.0, 0.0, 0.0]),
-                  ("y", [0.0, 1.0, 0.0]),
-                  ("z", [0.0, 0.0, 1.0]))
-    pos_joints, rot_joints = [], []
-    for ax_name, ax_vec in axis_table:
-        cube.add_joint(name=f"cube_pos_{ax_name}",
-                       type=mujoco.mjtJoint.mjJNT_SLIDE,
-                       axis=ax_vec,
-                       armature=cube_armature,
-                       frictionloss=cube_frictionloss)
-        pos_joints.append(f"cube_pos_{ax_name}")
-    for ax_name, ax_vec in axis_table:
-        cube.add_joint(name=f"cube_rot_{ax_name}",
-                       type=mujoco.mjtJoint.mjJNT_HINGE,
-                       axis=ax_vec,
-                       armature=cube_armature,
-                       frictionloss=cube_frictionloss)
-        rot_joints.append(f"cube_rot_{ax_name}")
-
-    def _add_pos_actuator(jname, kp, kd):
-        act = spec.add_actuator(
-            name=f"{jname}_a",
-            target=jname,
-            trntype=mujoco.mjtTrn.mjTRN_JOINT,
-            gaintype=mujoco.mjtGain.mjGAIN_FIXED,
-            biastype=mujoco.mjtBias.mjBIAS_AFFINE,
-        )
-        act.gainprm[0] = kp
-        act.biasprm[0] = 0.0
-        act.biasprm[1] = -kp
-        act.biasprm[2] = -kd
-
-    for jname in pos_joints:
-        _add_pos_actuator(jname, CUBE_OBJ_POS_KP_MAX, CUBE_OBJ_POS_KD_MAX)
-    for jname in rot_joints:
-        _add_pos_actuator(jname, CUBE_OBJ_ROT_KP_MAX, CUBE_OBJ_ROT_KD_MAX)
-
-    return spec
-
-
-def scale_obj_actuators(model: mujoco.MjModel, factor: float) -> None:
-    """Scale the cube_pos_* and cube_rot_* actuator gains by `factor`.
-
-    factor=1.0 leaves the XML-configured max stiffness in place;
-    factor=0.0 makes the object actuators inert. This is the
-    virtual-stick decay knob — call once per MPC tick.
-    """
-    factor = max(0.0, float(factor))
-    pos_max = (CUBE_OBJ_POS_KP_MAX, CUBE_OBJ_POS_KD_MAX)
-    rot_max = (CUBE_OBJ_ROT_KP_MAX, CUBE_OBJ_ROT_KD_MAX)
-    for aid in range(model.nu):
-        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, aid)
-        if name is None:
-            continue
-        if name.startswith("cube_pos_"):
-            kp, kd = pos_max
-        elif name.startswith("cube_rot_"):
-            kp, kd = rot_max
-        else:
-            continue
-        model.actuator_gainprm[aid, 0] = kp * factor
-        model.actuator_biasprm[aid, 1] = -kp * factor
-        model.actuator_biasprm[aid, 2] = -kd * factor
-
-
 def compile_dyn(*, base_xml: Path | str = BASE_XML, sim_dt: float = 0.01,
                 dump_to: Path | str | None = None):
-    spec = build_dyn_spec(base_xml=base_xml)
+    """Compile the base scene as-is for Stage 3 MPC.
+
+    The cube keeps its natural freejoint — no joint replacement, no
+    actuators, no virtual stick. Stage 3 drives only the hand (20 finger
+    actuators + a wrist-mocap orientation perturbation) and lets the
+    cube move freely under contact physics.
+    """
+    spec = mujoco.MjSpec.from_file(str(base_xml))
     if dump_to is not None:
         Path(dump_to).write_text(spec.to_xml())
     model = spec.compile()

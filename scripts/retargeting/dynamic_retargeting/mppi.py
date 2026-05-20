@@ -2,14 +2,14 @@
 
 Per MPC tick we run `max_iters` of:
     1. Sample N noisy control sequences via knot-spline interpolation.
-       - Per-component noise scales (finger / wrist / obj_pos / obj_rot
-         decoupled).
+       - Per-component noise scales (finger / wrist decoupled).
        - Per-horizon-step log-spaced annealing
-         (first_ctrl_noise_scale → last_ctrl_noise_scale).
+         (first_step_noise_scale → last_step_noise_scale; SPIDER convention
+         is LOW noise near term, HIGH noise far term so plan[0] converges
+         tightly between iters and the unknown future stays exploratory).
        - Sample 0 is forced to zero noise so the prior plan is always
          evaluated; we never regress against last iter's plan.
-    2. Roll all N samples out through `env.rollout_with_resample` (handles
-       resample-on-drop, virtual-stick gain decay via env state).
+    2. Roll all N samples out through `env.rollout_with_resample`.
     3. Score via `compute_horizon_reward` (per-step sums; lower-is-better
        errors are negated).
     4. Top-`top_frac` softmax → weighted plan update.
@@ -25,16 +25,13 @@ from scripts.retargeting.dynamic_retargeting.cpu_env import (
     CpuEnv,
     N_ACTION,
     N_FINGER_CTRL,
-    N_OBJ_POS_CTRL,
-    N_OBJ_ROT_CTRL,
     N_WRIST_DELTA,
     SLICE_FINGER,
-    SLICE_OBJ_POS,
-    SLICE_OBJ_ROT,
     SLICE_WRIST,
 )
 from scripts.retargeting.dynamic_retargeting.reward import (
     RewardWeights,
+    TERM_NAMES,
     compute_horizon_reward,
 )
 
@@ -48,50 +45,26 @@ class MPPIConfig:
     max_iters: int = 8               # per-tick refinement iterations
     n_substeps: int = 25             # mj_step calls per ref tick (sim_dt=0.002, ref_dt=0.05)
 
-    # Cross-entropy weighting
+    # Cross-entropy weighting. Lower temp = sharper weighting on top samples.
     top_frac: float = 0.1            # weight only the top-10% samples
-    softmax_temp: float = 1.0
+    softmax_temp: float = 0.3
 
     # Per-iter global noise annealing
     beta_traj: float = 0.7
 
     # Per-horizon-step log-space annealing (SPIDER first_/last_ctrl_noise_scale).
-    # noise_h(h) = exp( log(first) + (log(last) - log(first)) * h/(H-1) ).
-    first_step_noise_scale: float = 1.0
-    last_step_noise_scale: float = 0.3
+    # LOW noise on the near-term step (h=0 — about to execute, want plan[0]
+    # to converge tightly between iters) and HIGH noise on the far horizon
+    # end (h=H-1 — exploration of the unknown future).
+    first_step_noise_scale: float = 0.3
+    last_step_noise_scale: float = 1.0
 
-    # Virtual-stick "training wheels" for the optimizer. Linearly annealed
-    # ACROSS MPPI iterations within each MPC tick (matches SPIDER). Iter 0
-    # rolls out with stick=iter_stick_start so MPPI quickly finds reward-
-    # bearing actions; iter N rolls out with stick=iter_stick_end so the
-    # converged plan must hold the cube with fingers alone. The world step
-    # (apply plan[0]) always uses stick=0 — the stick never adds physics
-    # force, it only seeds the search.
-    iter_stick_start: float = 1.0
-    iter_stick_end: float = 0.0
-    iter_stick_schedule: str = "warm_then_off"   # "linear" or "warm_then_off"
-    """If "linear": stick linearly anneals from iter_stick_start (iter 0) to
-    iter_stick_end (iter max_iters-1). If "warm_then_off": iter 0 uses
-    iter_stick_start; all subsequent iters use iter_stick_end. The latter
-    gives MPC many iters of pure refinement against the converged stick
-    setting instead of mostly refining stick-dependent plans."""
-
-    # Per-component noise std (in ctrl units). With N=2048 samples and the
-    # two-axis annealing (per-iter beta_traj=0.7, per-step log 1.0→0.3),
-    # base noise can be aggressive — the late-iter / late-step samples
-    # naturally clamp down (e.g. ×0.10 by iter 3 step 7), and the
-    # zero-noise first sample preserves the prior. Finger noise needs to
-    # span enough range that grip configurations can actually be explored.
+    # Per-component noise std (in ctrl units).
     finger_noise_std: float = 0.15   # rad  (~9°) per joint per knot
     wrist_noise_std: float = 0.04    # rad axis-angle (~2.3°)
-    obj_pos_noise_std: float = 0.0   # default OFF: with stick-off iters, this
-    obj_rot_noise_std: float = 0.0   # ctrl has no force; with stick-on early
-                                     # iters it just randomly nudges the cube.
 
     # Action clipping
     wrist_delta_clip: float = 0.05   # rad axis-angle
-    obj_pos_delta_clip: float = 0.05 # m around the reference baseline
-    obj_rot_delta_clip: float = 0.30 # rad around the reference baseline
 
     # Resample-on-drop threshold (None disables the swap inside rollout).
     drop_threshold_m: float | None = 0.10
@@ -125,8 +98,6 @@ def _per_component_std(cfg: MPPIConfig) -> np.ndarray:
     std = np.empty(N_ACTION, dtype=np.float64)
     std[SLICE_FINGER] = cfg.finger_noise_std
     std[SLICE_WRIST] = cfg.wrist_noise_std
-    std[SLICE_OBJ_POS] = cfg.obj_pos_noise_std
-    std[SLICE_OBJ_ROT] = cfg.obj_rot_noise_std
     return std
 
 
@@ -145,18 +116,13 @@ def _per_horizon_step_anneal(cfg: MPPIConfig, H: int) -> np.ndarray:
 
 def _sample_actions(
     plan: np.ndarray,           # (H, N_ACTION)
-    obj_baseline: np.ndarray,   # (H, N_OBJ_POS_CTRL + N_OBJ_ROT_CTRL) — the
-                                # `ctrl-baseline` for obj dims; clipping is
-                                # done relative to it
     cfg: MPPIConfig,
     global_noise_scale: float,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Sample (N, H, N_ACTION) noisy controls around `plan`.
-
-    Sample 0 is the unmodified plan (zero noise) — guarantees the prior is
-    always evaluated this iteration.
-    """
+    """Sample (N, H, N_ACTION) noisy controls around `plan`. Sample 0 is the
+    unmodified plan (zero noise) — guarantees the prior is always
+    evaluated this iteration."""
     H = plan.shape[0]
     N = cfg.num_samples
     base_std = _per_component_std(cfg)                          # (A,)
@@ -173,21 +139,8 @@ def _sample_actions(
 
     samples = plan[None, :, :] + delta
 
-    # Clip per-component to keep ctrl in sane ranges.
     samples[..., SLICE_WRIST] = np.clip(
         samples[..., SLICE_WRIST], -cfg.wrist_delta_clip, cfg.wrist_delta_clip)
-    obj_pos_baseline = obj_baseline[:, :N_OBJ_POS_CTRL]
-    obj_rot_baseline = obj_baseline[:, N_OBJ_POS_CTRL:]
-    samples[..., SLICE_OBJ_POS] = np.clip(
-        samples[..., SLICE_OBJ_POS],
-        obj_pos_baseline[None, :, :] - cfg.obj_pos_delta_clip,
-        obj_pos_baseline[None, :, :] + cfg.obj_pos_delta_clip,
-    )
-    samples[..., SLICE_OBJ_ROT] = np.clip(
-        samples[..., SLICE_OBJ_ROT],
-        obj_rot_baseline[None, :, :] - cfg.obj_rot_delta_clip,
-        obj_rot_baseline[None, :, :] + cfg.obj_rot_delta_clip,
-    )
     return samples
 
 
@@ -211,7 +164,6 @@ def _topk_softmax(rews: np.ndarray, top_frac: float, temp: float) -> np.ndarray:
 def optimize_step(
     env: CpuEnv,
     plan: np.ndarray,                 # (H, N_ACTION)
-    obj_baseline: np.ndarray,         # (H, N_OBJ_CTRL) ref cube qpos this window
     ref_qpos: np.ndarray,             # (H, 27)
     ref_cube_pos: np.ndarray,         # (H, 3)
     ref_cube_quat: np.ndarray,        # (H, 4) wxyz
@@ -225,19 +177,22 @@ def optimize_step(
     Snapshots the current world state into the batch at the start of every
     iteration (each iter's rollout starts from the same physical state).
     """
-    info = {"rew_max": [], "rew_mean": [], "frac_terminated": [], "stick": []}
+    # Finger qvel reference for the qvel deviation penalty: per-horizon-step
+    # finite diff of the finger qpos reference. Skips wrist (mocap-driven)
+    # and cube (penalizing cube velocity blocks in-hand rotation).
+    ref_dt = cfg.n_substeps * 0.002
+    ref_finger_qvel = np.zeros_like(ref_qpos[..., 7:27])
+    if ref_qpos.shape[0] > 1:
+        ref_finger_qvel[:-1] = (ref_qpos[1:, 7:27] - ref_qpos[:-1, 7:27]) / ref_dt
+        ref_finger_qvel[-1] = ref_finger_qvel[-2]
+
+    info = {
+        "rew_max": [], "rew_mean": [], "frac_terminated": [],
+        "terms": {k: [] for k in TERM_NAMES},
+    }
     for it in range(cfg.max_iters):
         global_scale = cfg.beta_traj ** it
-        if cfg.iter_stick_schedule == "linear":
-            denom = max(1, cfg.max_iters - 1)
-            stick = cfg.iter_stick_start + (cfg.iter_stick_end - cfg.iter_stick_start) * (it / denom)
-        elif cfg.iter_stick_schedule == "warm_then_off":
-            stick = cfg.iter_stick_start if it == 0 else cfg.iter_stick_end
-        else:
-            raise ValueError(f"unknown iter_stick_schedule: {cfg.iter_stick_schedule}")
-        env.set_obj_decay(stick)
-        info["stick"].append(float(stick))
-        samples = _sample_actions(plan, obj_baseline, cfg, global_scale, rng)
+        samples = _sample_actions(plan, cfg, global_scale, rng)
 
         env.snapshot_world_into_batch()
         obs = env.rollout_with_resample(
@@ -248,20 +203,26 @@ def optimize_step(
             ref_cube_pos=ref_cube_pos,
             drop_threshold_m=cfg.drop_threshold_m,
         )
-        rews = compute_horizon_reward(
+        rews, term_per_sample = compute_horizon_reward(
             obs=obs,
             ref_qpos=ref_qpos,
             ref_cube_pos=ref_cube_pos,
             ref_cube_quat=ref_cube_quat,
             ref_wrist_quat=ref_wrist_quat,
+            ref_finger_qvel=ref_finger_qvel,
             actions=samples,
             weights=cfg.weights,
             contact_target_per_step=contact_target_per_step,
         )
         weights = _topk_softmax(rews, cfg.top_frac, cfg.softmax_temp)
         plan = (weights[:, None, None] * samples).sum(axis=0)
+        # Re-clip wrist after weighted average
+        plan[:, SLICE_WRIST] = np.clip(
+            plan[:, SLICE_WRIST], -cfg.wrist_delta_clip, cfg.wrist_delta_clip)
 
         info["rew_max"].append(float(rews.max()))
         info["rew_mean"].append(float(rews.mean()))
         info["frac_terminated"].append(float(obs["terminated"].mean()))
+        for k, v in term_per_sample.items():
+            info["terms"][k].append(float(v.mean()))
     return plan, info

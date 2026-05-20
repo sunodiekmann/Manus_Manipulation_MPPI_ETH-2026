@@ -1,18 +1,15 @@
 """CPU MuJoCo environment for Stage 3 sampling MPC.
 
-Loads the *dyn* scene from `build_ik_scene.compile_dyn`: cube freejoint is
-replaced by 3 slide + 3 hinge joints with position-style actuators (the
-"virtual stick"). Action vector is 29-dim per step:
+Loads the base scene (cube as a real freejoint, no virtual stick). Action
+vector is 23-dim per step:
 
     a[ 0:20] — finger position-actuator targets (replaces data.ctrl[:20])
     a[20:23] — wrist-orientation axis-angle delta (mocap rotation perturb)
-    a[23:26] — cube position target (slide actuator ctrl)
-    a[26:29] — cube rotation target (hinge actuator ctrl, intrinsic XYZ Euler)
 
-Wrist *position* mocap is always pinned to the reference. The actuator gain
-on the six cube DOFs is scaled at runtime via `set_obj_decay` to implement
-the virtual-stick decay schedule (early MPC ticks: stick on, fingers free
-to settle; late ticks: stick off, fingers must hold).
+Wrist *position* is always pinned to the reference; the wrist freejoint
+is anchored to the wrist mocap body by a WELD in the base XML. Cube is
+free under physics — fingers must grip and rotate it without any
+actuator assistance.
 
 Two environment objects:
     `world`  — one MjData advanced once per MPC tick with the chosen plan.
@@ -26,61 +23,38 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 
-from scripts.retargeting.build_ik_scene import compile_dyn, scale_obj_actuators
+from scripts.retargeting.build_ik_scene import compile_dyn
 
 
-# Action / state layout constants — kept here so mppi.py and reward.py
-# can reuse them without knowing about MjSpec specifics.
+# Action / state layout constants.
 N_HAND_QPOS = 27                 # wrist freejoint (7) + 20 finger joints
-N_CUBE_QPOS = 6                  # cube_pos_xyz + cube_rot_xyz (intrinsic XYZ)
+N_CUBE_QPOS = 7                  # cube freejoint: xyz + wxyz quat
 
 N_FINGER_CTRL = 20
 N_WRIST_DELTA = 3
-N_OBJ_POS_CTRL = 3
-N_OBJ_ROT_CTRL = 3
-N_OBJ_CTRL = N_OBJ_POS_CTRL + N_OBJ_ROT_CTRL
-N_ACTION = N_FINGER_CTRL + N_WRIST_DELTA + N_OBJ_CTRL  # 29
+N_ACTION = N_FINGER_CTRL + N_WRIST_DELTA  # 23
 
-# Slice helpers — index a (..., A) action array.
 SLICE_FINGER = slice(0, N_FINGER_CTRL)
 SLICE_WRIST = slice(N_FINGER_CTRL, N_FINGER_CTRL + N_WRIST_DELTA)
-SLICE_OBJ_POS = slice(N_FINGER_CTRL + N_WRIST_DELTA,
-                      N_FINGER_CTRL + N_WRIST_DELTA + N_OBJ_POS_CTRL)
-SLICE_OBJ_ROT = slice(N_FINGER_CTRL + N_WRIST_DELTA + N_OBJ_POS_CTRL,
-                      N_ACTION)
 
 FINGER_NAMES = ["thumb", "index", "middle", "ring", "little"]
 TIP_GEOMS = [f"{f}_tip" for f in FINGER_NAMES]
 TIP_BODIES = ["rl_dg_1_4", "rl_dg_2_4", "rl_dg_3_4", "rl_dg_4_4", "rl_dg_5_4"]
 CUBE_GEOM = "tracked_cube_geom"
 WRIST_MOCAP = "wrist_mocap"
+CUBE_FREEJOINT = "cube_freejoint"
 
 
 @dataclass
 class EnvIds:
     wrist_mocap: int
-    cube_qadr: int               # qpos start of the 6 cube DOFs
-    cube_dofadr: int             # qvel start of the 6 cube DOFs
+    cube_qadr: int               # qpos start of the 7-DOF cube freejoint
+    cube_dofadr: int             # qvel start of the 6-DOF cube velocity
     cube_geom_id: int
     tip_geom_ids: list[int]
     finger_act_lo: np.ndarray    # (20,)  ctrlrange[:, 0] for fingers
     finger_act_hi: np.ndarray    # (20,)
-
-
-def quat_to_euler_xyz_intrinsic(quat_wxyz: np.ndarray) -> np.ndarray:
-    """Convert wxyz quaternion → 3 intrinsic XYZ Euler angles matching the
-    dyn scene joint chain (cube_rot_x, cube_rot_y, cube_rot_z in body frame).
-    """
-    quat_xyzw = np.asarray([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]])
-    return R.from_quat(quat_xyzw).as_euler("XYZ", degrees=False)
-
-
-def euler_xyz_to_quat_wxyz(euler_xyz: np.ndarray) -> np.ndarray:
-    """Inverse of `quat_to_euler_xyz_intrinsic` for diagnostics / reward."""
-    q_xyzw = R.from_euler("XYZ", euler_xyz, degrees=False).as_quat()
-    return np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
 
 
 def axis_angle_to_quat_wxyz(axisangle: np.ndarray) -> np.ndarray:
@@ -103,20 +77,6 @@ def quat_mul_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     ])
 
 
-def cube_qpos_from_pose7(pose7: np.ndarray) -> np.ndarray:
-    """[x,y,z,qw,qx,qy,qz]  →  (6,) cube_qpos for the dyn scene."""
-    pos = np.asarray(pose7[:3], dtype=float)
-    euler = quat_to_euler_xyz_intrinsic(np.asarray(pose7[3:7], dtype=float))
-    return np.concatenate([pos, euler])
-
-
-def cube_pose7_from_qpos(cube_qpos: np.ndarray) -> np.ndarray:
-    """(6,) dyn cube_qpos → [x,y,z,qw,qx,qy,qz] pose vector."""
-    pos = cube_qpos[:3]
-    quat = euler_xyz_to_quat_wxyz(cube_qpos[3:6])
-    return np.concatenate([pos, quat])
-
-
 class CpuEnv:
     """Sequential CPU rollout env. Owns 1 world + N batch MjData."""
 
@@ -129,24 +89,22 @@ class CpuEnv:
         if self.model.nq != N_HAND_QPOS + N_CUBE_QPOS:
             raise ValueError(f"Model nq={self.model.nq}, expected "
                              f"{N_HAND_QPOS + N_CUBE_QPOS}")
-        if self.model.nu != N_FINGER_CTRL + N_OBJ_CTRL:
+        if self.model.nu != N_FINGER_CTRL:
             raise ValueError(f"Model nu={self.model.nu}, expected "
-                             f"{N_FINGER_CTRL + N_OBJ_CTRL}")
+                             f"{N_FINGER_CTRL}")
         self.ctrl_bias = np.zeros(N_FINGER_CTRL, dtype=np.float64)
-        self.obj_decay = 1.0  # current virtual-stick scale (full = 1, off = 0)
 
     def _resolve_ids(self) -> EnvIds:
         m = self.model
         wrist_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, WRIST_MOCAP)
         wrist_mid = int(m.body_mocapid[wrist_bid])
-        cube_jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "cube_pos_x")
+        cube_jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, CUBE_FREEJOINT)
         cube_qadr = int(m.jnt_qposadr[cube_jid])
         cube_dofadr = int(m.jnt_dofadr[cube_jid])
         cube_gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, CUBE_GEOM)
         tip_gids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, n) for n in TIP_GEOMS]
         if any(i < 0 for i in (wrist_mid, cube_qadr, cube_dofadr, cube_gid, *tip_gids)):
             raise ValueError("Failed to resolve required ids in dyn scene")
-        # Finger actuators are the first 20 (defined before the 6 cube actuators).
         finger_lo = m.actuator_ctrlrange[:N_FINGER_CTRL, 0].copy()
         finger_hi = m.actuator_ctrlrange[:N_FINGER_CTRL, 1].copy()
         return EnvIds(
@@ -159,12 +117,7 @@ class CpuEnv:
             finger_act_hi=finger_hi,
         )
 
-    # ── virtual-stick scaling ─────────────────────────────────────────────
-
-    def set_obj_decay(self, factor: float) -> None:
-        """Scale the 6 cube actuator gains by `factor` (0…1)."""
-        self.obj_decay = float(factor)
-        scale_obj_actuators(self.model, factor)
+    # ── closure-bias ─────────────────────────────────────────────────────
 
     def set_closure_bias(self, bias_rad: float) -> None:
         self.ctrl_bias = bias_rad * self._flexion_closure_direction()
@@ -183,9 +136,8 @@ class CpuEnv:
 
     def set_world_state(self, hand_qpos: np.ndarray, cube_pose7: np.ndarray,
                         qvel: np.ndarray | None = None) -> None:
-        cube_q = cube_qpos_from_pose7(cube_pose7)
         self.world.qpos[:N_HAND_QPOS] = hand_qpos
-        self.world.qpos[self.ids.cube_qadr : self.ids.cube_qadr + N_CUBE_QPOS] = cube_q
+        self.world.qpos[self.ids.cube_qadr : self.ids.cube_qadr + N_CUBE_QPOS] = cube_pose7
         self.world.qvel[:] = 0.0 if qvel is None else qvel
         self.world.mocap_pos[self.ids.wrist_mocap] = hand_qpos[0:3]
         self.world.mocap_quat[self.ids.wrist_mocap] = hand_qpos[3:7]
@@ -193,10 +145,35 @@ class CpuEnv:
 
     def get_world_cube_pose7(self) -> np.ndarray:
         cube_q = self.world.qpos[self.ids.cube_qadr : self.ids.cube_qadr + N_CUBE_QPOS]
-        return cube_pose7_from_qpos(cube_q)
+        return cube_q.copy()
 
     def get_world_cube_pos(self) -> np.ndarray:
         return self.world.qpos[self.ids.cube_qadr : self.ids.cube_qadr + 3].copy()
+
+    def warmup_grasp(self, cube_pose7: np.ndarray, finger_ctrl: np.ndarray,
+                     ref_wrist_pos: np.ndarray, ref_wrist_quat: np.ndarray,
+                     n_steps: int, closure_bias: float = 0.0) -> None:
+        """SPIDER-style virtual-stick initial grasp via *kinematic pin*: the
+        cube qpos is overwritten and its qvel zeroed after every substep so
+        fingers settle around a stationary cube. After warmup the cube is
+        released and physics takes over."""
+        if n_steps <= 0:
+            return
+        cube_qadr = self.ids.cube_qadr
+        cube_dofadr = self.ids.cube_dofadr
+        ctrl = np.asarray(finger_ctrl, dtype=np.float64).copy()
+        if closure_bias > 0.0:
+            ctrl += closure_bias * self._flexion_closure_direction()
+        ctrl = np.clip(ctrl, self.ids.finger_act_lo, self.ids.finger_act_hi)
+        self.world.qpos[cube_qadr : cube_qadr + N_CUBE_QPOS] = cube_pose7
+        self.world.qvel[cube_dofadr : cube_dofadr + 6] = 0.0
+        self.world.ctrl[:] = ctrl
+        self.world.mocap_pos[self.ids.wrist_mocap] = ref_wrist_pos
+        self.world.mocap_quat[self.ids.wrist_mocap] = ref_wrist_quat
+        for _ in range(n_steps):
+            mujoco.mj_step(self.model, self.world)
+            self.world.qpos[cube_qadr : cube_qadr + N_CUBE_QPOS] = cube_pose7
+            self.world.qvel[cube_dofadr : cube_dofadr + 6] = 0.0
 
     # ── action application ────────────────────────────────────────────────
 
@@ -208,8 +185,6 @@ class CpuEnv:
         delta = action[SLICE_WRIST]
         wrist_quat = quat_mul_wxyz(ref_wrist_quat, axis_angle_to_quat_wxyz(delta))
         data.ctrl[:N_FINGER_CTRL] = finger_ctrl
-        data.ctrl[N_FINGER_CTRL : N_FINGER_CTRL + N_OBJ_POS_CTRL] = action[SLICE_OBJ_POS]
-        data.ctrl[N_FINGER_CTRL + N_OBJ_POS_CTRL : N_FINGER_CTRL + N_OBJ_CTRL] = action[SLICE_OBJ_ROT]
         data.mocap_pos[self.ids.wrist_mocap] = ref_wrist_pos
         data.mocap_quat[self.ids.wrist_mocap] = wrist_quat
 
@@ -232,14 +207,14 @@ class CpuEnv:
 
     def rollout_with_resample(
         self,
-        actions: np.ndarray,            # (N, H, 29)  — MAY be modified in place
+        actions: np.ndarray,            # (N, H, 23)  — MAY be modified in place
         ref_wrist_pos: np.ndarray,      # (H, 3)
         ref_wrist_quat: np.ndarray,     # (H, 4)
         n_substeps: int,
         ref_cube_pos: np.ndarray,       # (H, 3)
         drop_threshold_m: float | None = None,
     ) -> dict:
-        """Roll out all N samples through the H-step horizon, stepping
+        """Roll all N samples through the H-step horizon, stepping
         horizon-by-horizon so we can swap dropped-cube samples with good
         ones between steps (SPIDER resample-on-drop). Returns observations
         used by the reward function plus per-sample terminate flag.
@@ -248,6 +223,7 @@ class CpuEnv:
         H = actions.shape[1]
         obs = {
             "qpos": np.zeros((N, H, self.model.nq), dtype=np.float64),
+            "qvel": np.zeros((N, H, self.model.nv), dtype=np.float64),
             "cube_pos": np.zeros((N, H, 3), dtype=np.float64),
             "cube_quat_wxyz": np.zeros((N, H, 4), dtype=np.float64),
             "tip_xpos": np.zeros((N, H, 5, 3), dtype=np.float64),
@@ -268,11 +244,10 @@ class CpuEnv:
                 self._apply_action_to_data(d, actions[i, h], ref_wpos_h, ref_wquat_h)
                 for _ in range(n_substeps):
                     mujoco.mj_step(self.model, d)
-                # observation
                 obs["qpos"][i, h] = d.qpos
+                obs["qvel"][i, h] = d.qvel
                 obs["cube_pos"][i, h] = d.qpos[cube_qadr : cube_qadr + 3]
-                obs["cube_quat_wxyz"][i, h] = euler_xyz_to_quat_wxyz(
-                    d.qpos[cube_qadr + 3 : cube_qadr + 6])
+                obs["cube_quat_wxyz"][i, h] = d.qpos[cube_qadr + 3 : cube_qadr + 7]
                 for f, gid in enumerate(tip_gids):
                     obs["tip_xpos"][i, h, f] = d.geom_xpos[gid]
                 for c in range(d.ncon):
@@ -285,10 +260,6 @@ class CpuEnv:
                     if other is not None:
                         obs["tip_in_contact"][i, h, tip_gids.index(other)] = True
 
-            # Resample-on-drop between horizon steps: replace samples whose
-            # cube has slipped beyond `drop_threshold_m` of the reference by
-            # cloning a good sample's state + ctrl history. Doesn't run on
-            # the last step (no future steps would benefit).
             if (drop_threshold_m is not None
                     and h < H - 1
                     and not terminated.all()):
@@ -307,15 +278,11 @@ class CpuEnv:
                         bd.ctrl[:] = gd.ctrl
                         bd.mocap_pos[:] = gd.mocap_pos
                         bd.mocap_quat[:] = gd.mocap_quat
-                        # Copy ctrl history through current step so downstream
-                        # reward sees the *applied* sequence.
                         actions[bi, : h + 1] = actions[gi, : h + 1]
-                        # Copy observations through current step too — keeps
-                        # per-sample obs trace internally consistent.
                         for key in obs:
                             obs[key][bi, : h + 1] = obs[key][gi, : h + 1]
                 elif dropped.all():
-                    terminated |= dropped  # nothing to copy from; let them be
+                    terminated |= dropped
 
         obs["terminated"] = terminated
         return obs

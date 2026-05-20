@@ -2,7 +2,12 @@
 
 This document is the **starting brief for a fresh session** that rewrites the offline retargeting pipeline along SPIDER's architectural lines while keeping the cube-specific advantages we've built (face segmentation, manual constraints).
 
-> **Status (2026-05-17, commit 5723a92):** Phases 0-3 + 5 done. Stage 3 (Phase 4) MPC architecture fully wired on mujoco_warp; tuning in progress (cube tracks early then drifts, drops mid-sequence). See "Phase 4 actual status" near bottom for handoff notes.
+> **Status (2026-05-20):** Phases 0-3 + 5 done. Stage 3 reworked — virtual stick
+> removed, real freejoint cube restored (this unlocked in-hand rotation). cube_pitch now
+> tracks ~70° rotation for ~170 ticks then drops at the hardest regrip; likely a Tesollo
+> kinematic limit. **See `dynamic_retargeting_status.md` for the current architecture,
+> knobs, results, and forward plan (recapture easier motions; possibly a task reward).**
+> The "Phase 4 actual status" section below is superseded by that doc.
 
 ## Why we're rewriting
 

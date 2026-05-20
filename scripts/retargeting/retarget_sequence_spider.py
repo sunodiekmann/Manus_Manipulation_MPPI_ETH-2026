@@ -66,6 +66,47 @@ def _xyzw_to_wxyz(q_xyzw):
     return np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
 
 
+def shift_cube_in_wrist_frame(cube_pose_world, wrist_world, shift_wrist):
+    """Translate each cube pose by `shift_wrist` (wrist-frame metres).
+
+    The IK targets fingertips at cube-frame offsets; shifting the cube
+    target re-anchors those offsets in world space, so when Stage 2 runs
+    the equality solver the resulting hand wraps the *shifted* cube and
+    the saved `retargeted_qpos` is internally consistent.
+
+    Args:
+        cube_pose_world: per-frame cube pose, each entry [x,y,z, qw,qx,qy,qz].
+            May be an (N, 7) float array or an N-length object array
+            containing 7-vectors or None.
+        wrist_world: per-frame raw wrist transform (4x4). Same container
+            semantics as cube_pose_world.
+        shift_wrist: (3,) translation in wrist frame.
+
+    Returns a new container with positions shifted. Orientation untouched.
+    Frames where the cube or wrist is missing/NaN are passed through.
+    """
+    shift = np.asarray(shift_wrist, dtype=float)
+    if np.allclose(shift, 0.0):
+        return cube_pose_world
+    N = len(cube_pose_world)
+    is_float = (isinstance(cube_pose_world, np.ndarray)
+                and cube_pose_world.dtype != object)
+    out = cube_pose_world.copy() if is_float else np.array(cube_pose_world, dtype=object).copy()
+    for i in range(N):
+        cpw = cube_pose_world[i]
+        ww = wrist_world[i]
+        if cpw is None or ww is None:
+            continue
+        cpw_a = np.asarray(cpw, dtype=float)
+        ww_a = np.asarray(ww, dtype=float)
+        if cpw_a.size < 3 or np.any(np.isnan(cpw_a[:3])) or np.any(np.isnan(ww_a)):
+            continue
+        new = cpw_a.copy()
+        new[:3] = new[:3] + ww_a[:3, :3] @ shift
+        out[i] = new
+    return out
+
+
 def _T_to_mocap(T):
     """Convert a 4x4 transform to (pos, quat_wxyz)."""
     pos = T[:3, 3]
@@ -92,15 +133,19 @@ def _make_index(model):
     return info, site_ids
 
 
-def _frame_targets(fingertips_cube_i, cube_pose_i, wrist_world_i, wrist_offset):
+def _frame_targets(fingertips_cube_i, cube_pose_i, wrist_world_i, wrist_offset,
+                   fingertip_offsets=None):
     """Compute the world-frame target poses for this frame.
 
     Returns (wrist_pos, wrist_quat_wxyz, cube_pos, cube_quat_wxyz,
              {finger_name: (pos, quat_wxyz)}) or None if the frame is invalid.
+    `fingertip_offsets` defaults to OFFLINE_TARGET_OFFSETS when None.
     """
     if (fingertips_cube_i is None or cube_pose_i is None
             or wrist_world_i is None):
         return None
+    if fingertip_offsets is None:
+        fingertip_offsets = OFFLINE_TARGET_OFFSETS
 
     T_world_wrist_anchor = apply_wrist_offset(wrist_world_i, wrist_offset)
     wrist_pos, wrist_quat = _T_to_mocap(T_world_wrist_anchor)
@@ -110,9 +155,6 @@ def _frame_targets(fingertips_cube_i, cube_pose_i, wrist_world_i, wrist_offset):
     cube_quat = cube_pose[3:7].copy()  # already wxyz from recording
 
     T_world_cube = pose_to_matrix(cube_pose)
-    # `map_cube_frame_target` expects T_world_wrist (not the anchor), because
-    # OFFLINE_TARGET_OFFSETS are wrist-frame quantities and the rotation
-    # needed is the wrist rotation (anchor differs only by a translation).
     quat_wrist_xyzw = R.from_matrix(np.asarray(wrist_world_i)[:3, :3]).as_quat()
 
     fingertip_targets = {}
@@ -121,7 +163,7 @@ def _frame_targets(fingertips_cube_i, cube_pose_i, wrist_world_i, wrist_offset):
         pos_world, q_world = map_cube_frame_target(
             raw[j], quat_wrist_xyzw, ft.finger,
             T_world_cube, np.asarray(wrist_world_i, dtype=float),
-            offsets=OFFLINE_TARGET_OFFSETS,
+            offsets=fingertip_offsets,
         )
         fingertip_targets[ft.target_body] = (
             pos_world, _xyzw_to_wxyz(q_world.as_quat()))
@@ -217,7 +259,9 @@ def _step_frame(model, data, mocap_idx, targets, *,
 
 def _run_session(session_dir: Path, *, show_viewer=False, force=False,
                  wrist_offset=DEFAULT_WRIST_OFFSET,
+                 fingertip_offsets=None,
                  pin_wrist=False, loop=False,
+                 cube_shift=None,
                  output_name="retargeted_sequence.npz"):
     # --loop is interactive observation only; never overwrite the canonical file.
     write_output = not loop
@@ -238,6 +282,14 @@ def _run_session(session_dir: Path, *, show_viewer=False, force=False,
     cube_pose_world = proc["cube_pose_world"]
     wrist_world = proc["right_wrist_world"]
 
+    if cube_shift is not None and not np.allclose(cube_shift, 0.0):
+        cube_pose_world = shift_cube_in_wrist_frame(
+            cube_pose_world, wrist_world, cube_shift)
+        print(f"  cube_shift (wrist frame, mm): "
+              f"[{cube_shift[0]*1000:+.1f}, {cube_shift[1]*1000:+.1f}, "
+              f"{cube_shift[2]*1000:+.1f}]  — applied to cube target, IK "
+              f"re-solves fingertip placement to match.")
+
     wrist_offset = np.asarray(wrist_offset, dtype=float)
 
     model, data = compile_ik(sim_dt=SIM_DT)
@@ -249,7 +301,8 @@ def _run_session(session_dir: Path, *, show_viewer=False, force=False,
     first_i = next(
         (i for i in range(N) if _frame_targets(
             fingertips_cube[i], cube_pose_world[i],
-            wrist_world[i], wrist_offset) is not None),
+            wrist_world[i], wrist_offset,
+            fingertip_offsets=fingertip_offsets) is not None),
         None,
     )
     if first_i is None:
@@ -258,7 +311,8 @@ def _run_session(session_dir: Path, *, show_viewer=False, force=False,
 
     targets0 = _frame_targets(
         fingertips_cube[first_i], cube_pose_world[first_i],
-        wrist_world[first_i], wrist_offset)
+        wrist_world[first_i], wrist_offset,
+        fingertip_offsets=fingertip_offsets)
     print(f"  Initial-guess search on frame {first_i} "
           f"({NUM_INITIAL_GUESSES} × {INITIAL_GUESS_STEPS} steps)…")
     best_res = _initial_guess_search(
@@ -274,7 +328,8 @@ def _run_session(session_dir: Path, *, show_viewer=False, force=False,
 
     def _process(i):
         t = _frame_targets(fingertips_cube[i], cube_pose_world[i],
-                           wrist_world[i], wrist_offset)
+                           wrist_world[i], wrist_offset,
+                           fingertip_offsets=fingertip_offsets)
         if t is None:
             return False
         _step_frame(model, data, mocap_idx, t, pin_wrist=pin_wrist)
@@ -314,13 +369,15 @@ def _run_session(session_dir: Path, *, show_viewer=False, force=False,
                 print(f"    [{i+1}/{N}] residual {res_mm:.1f} mm")
 
     if write_output:
-        np.savez_compressed(
-            output_path,
+        save_kwargs = dict(
             timeline=timeline,
             retargeted_qpos=retargeted_qpos,
             cube_pose_used=cube_pose_used,
             wrist_offset=wrist_offset,
         )
+        if cube_shift is not None:
+            save_kwargs["cube_shift"] = np.asarray(cube_shift, dtype=float)
+        np.savez_compressed(output_path, **save_kwargs)
         print(f"  Saved: {output_path}")
     else:
         print(f"  [skip-save] interactive mode (loop or no-pin-wrist) — no file written")
@@ -338,15 +395,49 @@ def main(argv=None):
     parser.add_argument("--pin-wrist", action="store_true",
                         help="Force the wrist qpos to the target each step. "
                              "Default off — finger-spring reaction looks more natural.")
+    parser.add_argument("--cube-shift", type=float, nargs=3, default=None,
+                        metavar=("X", "Y", "Z"),
+                        help="Shift the cube target by this 3-vector in "
+                             "wrist frame (metres) before IK. The IK then "
+                             "wraps the shifted cube, so the saved "
+                             "retargeted_qpos and cube_pose_used are mutually "
+                             "consistent (Stage 3 reads them as-is, no extra "
+                             "shift flag needed). Use to give the cube room "
+                             "from the palm when the recording places it "
+                             "uncomfortably close (cube_pitch case).")
+    parser.add_argument("--no-offsets", action="store_true",
+                        help="Zero both DEFAULT_WRIST_OFFSET and "
+                             "OFFLINE_TARGET_OFFSETS for this run, so the IK "
+                             "uses raw recorded fingertip-in-cube-frame "
+                             "positions without per-finger calibration. "
+                             "Diagnostic — shows what the retargeting looks "
+                             "like before any per-pose offset correction "
+                             "kicks in. The interior-only surface snap in "
+                             "tesollo_target_mapping still applies.")
     args = parser.parse_args(argv)
 
     if args.loop and not args.viewer:
         parser.error("--loop requires --viewer")
 
+    cube_shift = (np.asarray(args.cube_shift, dtype=float)
+                  if args.cube_shift is not None else None)
+
+    if args.no_offsets:
+        wrist_offset = np.zeros(3, dtype=float)
+        fingertip_offsets = {k: np.zeros(3, dtype=float)
+                             for k in OFFLINE_TARGET_OFFSETS.keys()}
+        print(f"  [no-offsets] zeroed wrist + fingertip offsets — diagnostic mode")
+    else:
+        wrist_offset = DEFAULT_WRIST_OFFSET
+        fingertip_offsets = OFFLINE_TARGET_OFFSETS
+
     for session_dir in args.session_dirs:
         print(f"[{session_dir}]")
         _run_session(session_dir, show_viewer=args.viewer, force=args.force,
-                     loop=args.loop, pin_wrist=args.pin_wrist)
+                     loop=args.loop, pin_wrist=args.pin_wrist,
+                     cube_shift=cube_shift,
+                     wrist_offset=wrist_offset,
+                     fingertip_offsets=fingertip_offsets)
 
 
 if __name__ == "__main__":

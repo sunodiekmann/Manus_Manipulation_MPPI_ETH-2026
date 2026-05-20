@@ -13,23 +13,30 @@ from scripts.utils.config import CUBE_SIZE
 # Half-extent of the tracked cube (cube-frame, AABB centred at origin).
 _CUBE_HALF = CUBE_SIZE / 2
 
-# Small outward margin: keep targets at least this far from the cube surface
-# so the position-controlled finger doesn't drive the tip geom into the cube.
-_CUBE_SURFACE_MARGIN = 0.002   # 2 mm
+# Outward margin: position-controlled finger tips have a finite geom radius
+# (~5-9 mm). When we snap an INTERIOR target outside the cube, we push it to
+# cube_half + margin so the fingertip *surface* just-touches the cube
+# instead of penetrating. 5 mm matches the shortest-axis half-size of the
+# fingertip geoms in output_mocap_physics.xml.
+_CUBE_SURFACE_MARGIN = 0.005   # 5 mm
 
 
 def _clamp_target_outside_cube(p_cube: np.ndarray) -> np.ndarray:
-    """If p_cube sits inside the cube (or within the surface margin), project
-    it onto the nearest cube face plus a small outward margin. Otherwise
-    leave it alone. p_cube is expressed in cube frame (AABB centre = origin).
+    """Push an INTERIOR cube-frame target out to cube_half + margin on the
+    nearest face. Exterior targets are left as-is — slightly hovering is
+    a milder failure mode than forcing contact where physics won't.
+
+    Interior targets are unphysical (the fingertip can't fit inside the
+    cube), so we always push them out. Exterior targets just mean the
+    finger may be slightly off-surface; spider_contact's SD-mask will
+    correctly classify those frames as "not in geom contact" and MPC
+    won't be forced to fake a contact it can't achieve.
     """
     abs_p = np.abs(p_cube)
-    # Outside the cube already?
-    if abs_p.max() >= _CUBE_HALF + _CUBE_SURFACE_MARGIN:
-        return p_cube
-    # Inside (or within margin): project to the dominant face.
-    idx = int(np.argmax(abs_p))
+    if abs_p.max() >= _CUBE_HALF:
+        return p_cube  # exterior — leave alone
     out = p_cube.copy()
+    idx = int(np.argmax(abs_p))
     sign = 1.0 if p_cube[idx] >= 0.0 else -1.0
     out[idx] = sign * (_CUBE_HALF + _CUBE_SURFACE_MARGIN)
     return out
@@ -91,13 +98,15 @@ def map_cube_frame_target(
     # bias is a finger/wrist-frame quantity, so a constant correction expressed
     # in the wrist frame stays well-aligned regardless of cube orientation.
     # Rotate offset wrist→cube and add to the cube-frame target.
+    pos_cube_adjusted = np.asarray(pos_cube, dtype=float) * scale
     offset_cube = R_world_cube.T @ (R_world_wrist @ offsets[finger])
-    pos_cube_adjusted = np.asarray(pos_cube, dtype=float) * scale + offset_cube
+    pos_cube_adjusted = pos_cube_adjusted + offset_cube
 
-    # Don't ask IK (or downstream MPPI) to drive a fingertip inside the cube —
-    # project any inside-cube target onto the nearest face. Calibration alone
-    # cannot guarantee outside-cube targets across sequences whose grip is
-    # firmer than the statics holds the offsets were fit to.
+    # Interior-only snap: push targets that landed inside the cube out to
+    # the nearest face + margin so the fingertip doesn't penetrate. Leave
+    # exterior targets alone — hovering is a softer failure than forcing
+    # MPC to fake contact, and lets spider_contact's SD-mask correctly
+    # report frames as not-in-contact.
     pos_cube_adjusted = _clamp_target_outside_cube(pos_cube_adjusted)
 
     pos_world = R_world_cube @ pos_cube_adjusted + t_world_cube

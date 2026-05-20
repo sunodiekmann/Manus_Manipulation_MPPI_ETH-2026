@@ -1,15 +1,13 @@
 """GPU-batched rollout for Stage 3 sampling MPC, on MuJoCo Warp.
 
-Mirrors `cpu_env.CpuEnv` semantics — same dyn scene, same 29-dim action
-layout, same `rollout_with_resample` signature — but with N worlds stepped
-in parallel via NVIDIA Warp CUDA kernels. SPIDER uses this backend for the
-same reason: a single GPU dispatch of N=2048 × H=8 horizon steps × n
-substeps is orders of magnitude faster than sequential CPU rollouts.
+Mirrors `cpu_env.CpuEnv` semantics — same dyn scene (cube as a real
+freejoint, no virtual stick), same 23-dim action layout, same
+`rollout_with_resample` signature — but with N worlds stepped in parallel
+via NVIDIA Warp CUDA kernels.
 
-Host↔device data shuffling per MPC tick is small (action knots in, cube
-state out for resample-on-drop, reward computed host-side from arrays the
-size of N samples). The first call compiles + caches Warp kernels on disk
-(~30s); subsequent runs are fast.
+Host↔device shuffling per MPC tick is small (action knots in, cube state
+out for resample-on-drop, reward computed host-side). First call compiles
++ caches Warp kernels on disk; subsequent runs are fast.
 """
 from __future__ import annotations
 
@@ -20,26 +18,20 @@ import mujoco_warp as mjwp
 import numpy as np
 import warp as wp
 
-from scripts.retargeting.build_ik_scene import compile_dyn, scale_obj_actuators
+from scripts.retargeting.build_ik_scene import compile_dyn
 from scripts.retargeting.dynamic_retargeting.cpu_env import (
     CUBE_GEOM,
+    CUBE_FREEJOINT,
     N_ACTION,
     N_CUBE_QPOS,
     N_FINGER_CTRL,
     N_HAND_QPOS,
-    N_OBJ_CTRL,
-    N_OBJ_POS_CTRL,
     N_WRIST_DELTA,
     SLICE_FINGER,
-    SLICE_OBJ_POS,
-    SLICE_OBJ_ROT,
     SLICE_WRIST,
     TIP_GEOMS,
     WRIST_MOCAP,
     axis_angle_to_quat_wxyz,
-    cube_qpos_from_pose7,
-    cube_pose7_from_qpos,
-    euler_xyz_to_quat_wxyz,
     quat_mul_wxyz,
 )
 
@@ -72,20 +64,19 @@ def _batched_axis_angle_to_quat(aa: np.ndarray) -> np.ndarray:
 
 class MjwpEnv:
     """Same surface as cpu_env.CpuEnv (set_world_state, step_world,
-    snapshot_world_into_batch, rollout_with_resample, set_obj_decay,
+    snapshot_world_into_batch, rollout_with_resample, warmup_grasp,
     set_closure_bias, get_world_cube_*), but stepping N worlds in parallel
     on GPU via mujoco_warp.
     """
 
     def __init__(self, num_samples: int, sim_dt: float = 0.002):
         self.mj_model, _ = compile_dyn(sim_dt=sim_dt)
-        # SPIDER's mjwp settings: implicitfast integrator, moderate solver iters.
         self.mj_model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
         self.mj_model.opt.iterations = 20
         self.mj_model.opt.ls_iterations = 50
-        if self.mj_model.nu != N_FINGER_CTRL + N_OBJ_CTRL:
+        if self.mj_model.nu != N_FINGER_CTRL:
             raise ValueError(f"Model nu={self.mj_model.nu}, expected "
-                             f"{N_FINGER_CTRL + N_OBJ_CTRL}")
+                             f"{N_FINGER_CTRL}")
         if self.mj_model.nq != N_HAND_QPOS + N_CUBE_QPOS:
             raise ValueError(f"Model nq={self.mj_model.nq}, expected "
                              f"{N_HAND_QPOS + N_CUBE_QPOS}")
@@ -98,7 +89,7 @@ class MjwpEnv:
         wrist_bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, WRIST_MOCAP)
         self.wrist_mocap_idx = int(m.body_mocapid[wrist_bid])
         self.nmocap = int(m.nmocap)
-        cube_jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "cube_pos_x")
+        cube_jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, CUBE_FREEJOINT)
         self.cube_qadr = int(m.jnt_qposadr[cube_jid])
         self.cube_dofadr = int(m.jnt_dofadr[cube_jid])
         self.tip_gids = tuple(
@@ -112,24 +103,13 @@ class MjwpEnv:
         self.finger_act_lo = m.actuator_ctrlrange[:N_FINGER_CTRL, 0].copy()
         self.finger_act_hi = m.actuator_ctrlrange[:N_FINGER_CTRL, 1].copy()
 
-        # Two parallel Data objects: one with nworld=1 for the outer world,
-        # and one with nworld=N for the rollout batch. Both share the same
-        # Model. We cache the max-gain copies of actuator_gainprm/biasprm
-        # so set_obj_decay can write scaled values in-place without
-        # invalidating the CUDA Graph capture below.
+        # Two parallel Data objects: nworld=1 for the outer world and
+        # nworld=N for the rollout batch. Both share the same Model.
         self.mw = mjwp.put_model(m)
-        self._max_gainprm = self.mw.actuator_gainprm.numpy().copy()
-        self._max_biasprm = self.mw.actuator_biasprm.numpy().copy()
-        # Preallocate constraint workspace generously. mjwp warns
-        # `nefc overflow - please increase njmax to N` and falls back to a
-        # slow path when contacts spike; ~128 covers our cube + finger
-        # contact set with headroom.
         self.dw_world = mjwp.make_data(m, nworld=1, njmax=256)
         self.dw_batch = mjwp.make_data(m, nworld=self.num_samples, njmax=256)
 
-        # CUDA Graph capture for both steppers — replaces the ~4 ms launch
-        # overhead per mjwp.step with a single graph dispatch (~50 us at
-        # any N). Warmup once so kernels compile, then capture.
+        # CUDA Graph capture for both steppers.
         mjwp.step(self.mw, self.dw_world); wp.synchronize()
         mjwp.step(self.mw, self.dw_batch); wp.synchronize()
         with wp.ScopedCapture() as cap_w:
@@ -140,8 +120,7 @@ class MjwpEnv:
             mjwp.step(self.mw, self.dw_batch)
         wp.synchronize()
         self._graph_batch = cap_b.graph
-        # Host-side mirrors of the world state. Kept so we don't have to
-        # round-trip qpos every time we need to read it.
+        # Host-side mirrors of the world state.
         self._world_qpos = np.zeros(self.nq, dtype=np.float64)
         self._world_qvel = np.zeros(self.nv, dtype=np.float64)
         self._world_mocap_pos = np.zeros((self.nmocap, 3), dtype=np.float64)
@@ -150,30 +129,8 @@ class MjwpEnv:
         self._world_ctrl = np.zeros(self.nu, dtype=np.float64)
 
         self.ctrl_bias = np.zeros(N_FINGER_CTRL, dtype=np.float64)
-        self.obj_decay = 1.0
 
     # ── ergonomic API mirror of CpuEnv ────────────────────────────────────
-
-    def set_obj_decay(self, factor: float) -> None:
-        """Scale the 6 cube actuator gains in-place. The CUDA Graph captured
-        in __init__ closes over the device pointers of mw.actuator_gainprm /
-        biasprm — writing into those arrays takes effect on subsequent
-        graph launches without recapture.
-        """
-        self.obj_decay = float(factor)
-        # We don't bother with the mj_model copy here — that path is only
-        # used to compile the dyn spec once. Apply the decay directly to
-        # the device arrays via the cached max values.
-        scaled_gain = self._max_gainprm.copy()
-        scaled_bias = self._max_biasprm.copy()
-        # Cube actuators are the last 6 (indices 20..26). gainprm/biasprm
-        # have shape (1, 26, 10).
-        cube_slice = slice(N_FINGER_CTRL, N_FINGER_CTRL + N_OBJ_CTRL)
-        scaled_gain[:, cube_slice, 0] *= factor                       # kp
-        scaled_bias[:, cube_slice, 1] *= factor                       # -kp
-        scaled_bias[:, cube_slice, 2] *= factor                       # -kv
-        self.mw.actuator_gainprm.assign(scaled_gain)
-        self.mw.actuator_biasprm.assign(scaled_bias)
 
     def set_closure_bias(self, bias_rad: float) -> None:
         self.ctrl_bias = bias_rad * self._flexion_closure_direction()
@@ -190,9 +147,8 @@ class MjwpEnv:
 
     def set_world_state(self, hand_qpos: np.ndarray, cube_pose7: np.ndarray,
                         qvel: np.ndarray | None = None) -> None:
-        cube_q = cube_qpos_from_pose7(cube_pose7)
         self._world_qpos[:N_HAND_QPOS] = hand_qpos
-        self._world_qpos[self.cube_qadr : self.cube_qadr + N_CUBE_QPOS] = cube_q
+        self._world_qpos[self.cube_qadr : self.cube_qadr + N_CUBE_QPOS] = cube_pose7
         self._world_qvel[:] = 0.0 if qvel is None else qvel
         self._world_mocap_pos[self.wrist_mocap_idx] = hand_qpos[0:3]
         self._world_mocap_quat[self.wrist_mocap_idx] = hand_qpos[3:7]
@@ -211,8 +167,40 @@ class MjwpEnv:
         return self._world_qpos[self.cube_qadr : self.cube_qadr + 3].copy()
 
     def get_world_cube_pose7(self) -> np.ndarray:
-        cube_q = self._world_qpos[self.cube_qadr : self.cube_qadr + N_CUBE_QPOS]
-        return cube_pose7_from_qpos(cube_q)
+        return self._world_qpos[self.cube_qadr : self.cube_qadr + N_CUBE_QPOS].copy()
+
+    def warmup_grasp(self, cube_pose7: np.ndarray, finger_ctrl: np.ndarray,
+                     ref_wrist_pos: np.ndarray, ref_wrist_quat: np.ndarray,
+                     n_steps: int, closure_bias: float = 0.0) -> None:
+        """Kinematic-pin warmup: step physics for n_steps with the cube
+        qpos overwritten + qvel zeroed after every substep so fingers
+        settle around a stationary cube. Pulls qpos/qvel back to host once
+        at the end."""
+        if n_steps <= 0:
+            return
+        ctrl = np.asarray(finger_ctrl, dtype=np.float64).copy()
+        if closure_bias > 0.0:
+            ctrl += closure_bias * self._flexion_closure_direction()
+        ctrl = np.clip(ctrl, self.finger_act_lo, self.finger_act_hi)
+        self._world_ctrl[:N_FINGER_CTRL] = ctrl
+        self._world_mocap_pos[self.wrist_mocap_idx] = ref_wrist_pos
+        self._world_mocap_quat[self.wrist_mocap_idx] = ref_wrist_quat
+        self._world_qpos[self.cube_qadr : self.cube_qadr + N_CUBE_QPOS] = cube_pose7
+        self._world_qvel[self.cube_dofadr : self.cube_dofadr + 6] = 0.0
+        self._push_world_state()
+        cube_qadr = self.cube_qadr
+        cube_dofadr = self.cube_dofadr
+        for _ in range(n_steps):
+            wp.capture_launch(self._graph_world)
+            # Pull → re-pin cube → push back. Cheap (only 50 substeps).
+            qp = self.dw_world.qpos.numpy()[0].copy()
+            qv = self.dw_world.qvel.numpy()[0].copy()
+            qp[cube_qadr : cube_qadr + N_CUBE_QPOS] = cube_pose7
+            qv[cube_dofadr : cube_dofadr + 6] = 0.0
+            self.dw_world.qpos.assign(qp[None].astype(np.float32))
+            self.dw_world.qvel.assign(qv[None].astype(np.float32))
+        self._world_qpos[:] = self.dw_world.qpos.numpy()[0]
+        self._world_qvel[:] = self.dw_world.qvel.numpy()[0]
 
     @property
     def world(self):
@@ -230,8 +218,6 @@ class MjwpEnv:
         delta = action[SLICE_WRIST]
         wrist_quat = quat_mul_wxyz(ref_wrist_quat, axis_angle_to_quat_wxyz(delta))
         self._world_ctrl[:N_FINGER_CTRL] = finger_ctrl
-        self._world_ctrl[N_FINGER_CTRL : N_FINGER_CTRL + N_OBJ_POS_CTRL] = action[SLICE_OBJ_POS]
-        self._world_ctrl[N_FINGER_CTRL + N_OBJ_POS_CTRL : N_FINGER_CTRL + N_OBJ_CTRL] = action[SLICE_OBJ_ROT]
         self._world_mocap_pos[self.wrist_mocap_idx] = ref_wrist_pos
         self._world_mocap_quat[self.wrist_mocap_idx] = wrist_quat
 
@@ -252,7 +238,6 @@ class MjwpEnv:
         mp_N = np.broadcast_to(self._world_mocap_pos[None], (self.num_samples, self.nmocap, 3)).astype(np.float32)
         mq_N = np.broadcast_to(self._world_mocap_quat[None], (self.num_samples, self.nmocap, 4)).astype(np.float32)
         ctrl_N = np.zeros((self.num_samples, self.nu), dtype=np.float32)
-        # `assign` requires a writable contiguous array.
         self.dw_batch.qpos.assign(np.ascontiguousarray(qpos_N))
         self.dw_batch.qvel.assign(np.ascontiguousarray(qvel_N))
         self.dw_batch.mocap_pos.assign(np.ascontiguousarray(mp_N))
@@ -261,7 +246,7 @@ class MjwpEnv:
 
     def rollout_with_resample(
         self,
-        actions: np.ndarray,            # (N, H, 29)  — MAY be modified in place
+        actions: np.ndarray,            # (N, H, 23)  — MAY be modified in place
         ref_wrist_pos: np.ndarray,      # (H, 3)
         ref_wrist_quat: np.ndarray,     # (H, 4) wxyz
         n_substeps: int,
@@ -276,12 +261,11 @@ class MjwpEnv:
             "cube_pos": np.zeros((N, H, 3), dtype=np.float64),
             "cube_quat_wxyz": np.zeros((N, H, 4), dtype=np.float64),
             "tip_xpos": np.zeros((N, H, 5, 3), dtype=np.float64),
-            "tip_in_contact": np.zeros((N, H, 5), dtype=bool),  # unused; here for API parity
+            "tip_in_contact": np.zeros((N, H, 5), dtype=bool),  # unused; for API parity
         }
         terminated = np.zeros(N, dtype=bool)
         rng = np.random.default_rng()
 
-        # Host buffers for ctrl + mocap_quat written each step.
         ctrl_buf = np.zeros((N, self.nu), dtype=np.float32)
         mocap_pos_buf = np.broadcast_to(
             self._world_mocap_pos[None], (N, self.nmocap, 3)).astype(np.float32).copy()
@@ -291,12 +275,10 @@ class MjwpEnv:
         cube_qadr = self.cube_qadr
 
         for h in range(H):
-            action_h = actions[:, h]                                # (N, 29)
+            action_h = actions[:, h]                                # (N, 23)
             finger = np.clip(action_h[:, SLICE_FINGER] + self.ctrl_bias,
                              self.finger_act_lo, self.finger_act_hi)
             ctrl_buf[:, :N_FINGER_CTRL] = finger
-            ctrl_buf[:, N_FINGER_CTRL : N_FINGER_CTRL + N_OBJ_POS_CTRL] = action_h[:, SLICE_OBJ_POS]
-            ctrl_buf[:, N_FINGER_CTRL + N_OBJ_POS_CTRL : N_FINGER_CTRL + N_OBJ_CTRL] = action_h[:, SLICE_OBJ_ROT]
 
             delta = action_h[:, SLICE_WRIST]                        # (N, 3)
             delta_q = _batched_axis_angle_to_quat(delta)             # (N, 4)
@@ -312,7 +294,6 @@ class MjwpEnv:
             for _ in range(n_substeps):
                 wp.capture_launch(self._graph_batch)
 
-            # Pull state out for observation + resample decisions.
             qpos_N = self.dw_batch.qpos.numpy()                      # (N, nq)
             qvel_N = self.dw_batch.qvel.numpy()                      # (N, nv)
             geom_xpos = self.dw_batch.geom_xpos.numpy()              # (N, ngeom, 3)
@@ -320,10 +301,7 @@ class MjwpEnv:
             obs["qvel"][:, h] = qvel_N
             cube_pos = qpos_N[:, cube_qadr : cube_qadr + 3]
             obs["cube_pos"][:, h] = cube_pos
-            cube_euler = qpos_N[:, cube_qadr + 3 : cube_qadr + 6]
-            # Euler XYZ → wxyz quaternion (vectorised).
-            cube_quat = _euler_xyz_to_quat_wxyz_batched(cube_euler)
-            obs["cube_quat_wxyz"][:, h] = cube_quat
+            obs["cube_quat_wxyz"][:, h] = qpos_N[:, cube_qadr + 3 : cube_qadr + 7]
             for f, gid in enumerate(self.tip_gids):
                 obs["tip_xpos"][:, h, f] = geom_xpos[:, gid]
 
@@ -337,7 +315,6 @@ class MjwpEnv:
                     bad_idx = np.where(dropped)[0]
                     good_idx = np.where(good)[0]
                     picks = rng.choice(good_idx, size=bad_idx.shape[0], replace=True)
-                    # Swap state on host arrays, then push back.
                     qvel_N = self.dw_batch.qvel.numpy().copy()
                     mp_N = mocap_pos_buf.copy()
                     mq_N = mocap_quat_buf.copy()
@@ -349,8 +326,7 @@ class MjwpEnv:
                     mq_N[bad_idx] = mq_N[picks]
                     ctrl_N[bad_idx] = ctrl_N[picks]
                     actions[bad_idx, : h + 1] = actions[picks, : h + 1]
-                    # And mirror the obs trace so reward sees a consistent history.
-                    for key in ("qpos", "cube_pos", "cube_quat_wxyz", "tip_xpos"):
+                    for key in ("qpos", "qvel", "cube_pos", "cube_quat_wxyz", "tip_xpos"):
                         obs[key][bad_idx, : h + 1] = obs[key][picks, : h + 1]
                     self.dw_batch.qpos.assign(qpos_N_w.astype(np.float32))
                     self.dw_batch.qvel.assign(qvel_N.astype(np.float32))
@@ -366,35 +342,17 @@ class MjwpEnv:
         return obs
 
 
-def _euler_xyz_to_quat_wxyz_batched(euler: np.ndarray) -> np.ndarray:
-    """Vectorised over leading dims; matches `euler_xyz_to_quat_wxyz`."""
-    cx, cy, cz = np.cos(0.5 * euler[..., 0]), np.cos(0.5 * euler[..., 1]), np.cos(0.5 * euler[..., 2])
-    sx, sy, sz = np.sin(0.5 * euler[..., 0]), np.sin(0.5 * euler[..., 1]), np.sin(0.5 * euler[..., 2])
-    return np.stack([
-        cx * cy * cz - sx * sy * sz,
-        sx * cy * cz + cx * sy * sz,
-        cx * sy * cz - sx * cy * sz,
-        cx * cy * sz + sx * sy * cz,
-    ], axis=-1)
-
-
 class _WorldView:
     """Read-only view of env.world that mirrors CpuEnv.world.qpos etc.
-
-    optimize_sequence_dynamic.py uses `env.world.qpos[:27]` and `[27:34]`
-    (7-d cube freejoint) but we have 6-d cube here. The output saving path
-    expects pose7 for cube, so we reconstruct via cube_pose7_from_qpos.
+    Returns a 34-vector: [hand_qpos (27), cube_pose7 (7)].
     """
     def __init__(self, env: "MjwpEnv"):
         self._env = env
 
     @property
     def qpos(self):
-        """Return a (34,) array: [hand_qpos (27), cube_pose7 (7)] — same
-        layout that `optimize_sequence_dynamic.py` expects when slicing."""
         env = self._env
-        cube_pose7 = env.get_world_cube_pose7()
-        out = np.zeros(N_HAND_QPOS + 7, dtype=np.float64)
+        out = np.zeros(N_HAND_QPOS + N_CUBE_QPOS, dtype=np.float64)
         out[:N_HAND_QPOS] = env._world_qpos[:N_HAND_QPOS]
-        out[N_HAND_QPOS:] = cube_pose7
+        out[N_HAND_QPOS:] = env.get_world_cube_pose7()
         return out

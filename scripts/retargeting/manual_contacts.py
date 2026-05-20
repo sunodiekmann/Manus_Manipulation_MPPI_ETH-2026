@@ -128,3 +128,27 @@ def project_target_onto_face(
             continue
         out[ax] = float(np.clip(out[ax], -bound, bound))
     return out
+
+
+def project_target_to_nearest_face(
+    p_cube: np.ndarray,
+    cube_half_m: float,
+    inset_m: float = 0.001,
+    outward_margin_m: float = 0.0,
+) -> np.ndarray:
+    """Project a cube-frame point onto the nearest cube face (SD ≈ 0).
+
+    Picks the face automatically via argmax of |coord|. Interior points
+    snap to the closest face; exterior points snap to the face you'd hit
+    first along the dominant axis. `outward_margin_m` shifts the result
+    outward along the face normal — set to the fingertip geom half-size
+    to make the commanded centre sit so the fingertip *surface* touches
+    the cube (5 mm matches output_mocap_physics.xml's tip class).
+    """
+    axis = int(np.argmax(np.abs(p_cube)))
+    sign_pos = p_cube[axis] >= 0
+    face_id = 2 * axis + (0 if sign_pos else 1)
+    out = project_target_onto_face(p_cube, face_id, cube_half_m, inset_m)
+    if outward_margin_m != 0.0:
+        out[axis] += (1.0 if sign_pos else -1.0) * outward_margin_m
+    return out
