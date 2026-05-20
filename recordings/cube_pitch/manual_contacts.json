@@ -1,9 +1,0 @@
-{
-  "_comment": "Manual contact constraints for cube_pitch. Index/middle/ring should only ever touch the +z face (top of the cube); little should never make contact. Time bounds omitted = whole sequence.",
-  "constraints": [
-    {"finger": "index",  "face": "+z"},
-    {"finger": "middle", "face": "+z"},
-    {"finger": "ring",   "face": "+z"},
-    {"finger": "little", "face": null}
-  ]
-}

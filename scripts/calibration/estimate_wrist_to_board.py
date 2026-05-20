@@ -20,7 +20,7 @@ from scripts.utils.config import (
     RIGHT_GLOVE_SERIAL,
 )
 
-GLOVE = "left"
+GLOVE = "right"
 BOARD_ID = LEFT_BOARD_ID if GLOVE == "left" else RIGHT_BOARD_ID
 
 OUTPUT_JSON = (

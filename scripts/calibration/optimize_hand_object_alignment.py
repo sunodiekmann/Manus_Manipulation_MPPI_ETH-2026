@@ -27,7 +27,7 @@ from scripts.utils.transforms import (
 )
 
 # ─── CONFIGURE HERE ──────────────────────────────────────────────────────────
-GLOVE = "left"           # "left" or "right"
+GLOVE = "right"           # "left" or "right"
 FINGERTIP_RADIUS = 0.008  # meters — approximate fingertip contact sphere radius
 NUM_FRAMES_PER_CAPTURE = 10  # frames averaged into one captured sample
 # ─────────────────────────────────────────────────────────────────────────────
