@@ -33,35 +33,39 @@ from scripts.retargeting.dynamic_retargeting.reward import (
     RewardWeights,
     TERM_NAMES,
     compute_horizon_reward,
+    rotvec_from_quat_seq,
 )
 
 
 @dataclass
 class MPPIConfig:
-    # Sampling budget
-    horizon_steps: int = 8           # H, in ref-tick units
-    num_samples: int = 256           # N (SPIDER's default 2048; CPU-tractable 256)
-    num_knots: int = 4               # noise knots, interpolated to H
-    max_iters: int = 8               # per-tick refinement iterations
-    n_substeps: int = 25             # mj_step calls per ref tick (sim_dt=0.002, ref_dt=0.05)
+    # Sampling budget. Defaults are SPIDER-matched (their Config + mjwp example):
+    # 4 control steps over a 1.6s horizon, one knot each (no interpolation),
+    # 40 sim-substeps per control step at sim_dt=0.01 → ctrl_dt=0.4s.
+    horizon_steps: int = 4           # H control steps (SPIDER horizon/ctrl_dt = 1.6/0.4)
+    num_samples: int = 1024          # N (SPIDER example 1024; Config default 2048)
+    num_knots: int = 4               # control knots; == H here → no interpolation
+    max_iters: int = 16              # per-step refinement iters (SPIDER, early-stoppable)
+    n_substeps: int = 40             # mj_step per control step (ctrl_dt/sim_dt = 0.4/0.01)
+    sim_dt: float = 0.01             # SPIDER setup_mj_model timestep
 
     # Cross-entropy weighting. Lower temp = sharper weighting on top samples.
     top_frac: float = 0.1            # weight only the top-10% samples
-    softmax_temp: float = 0.3
+    softmax_temp: float = 0.1        # SPIDER temperature
 
-    # Per-iter global noise annealing
-    beta_traj: float = 0.7
+    # Per-iter global noise annealing. SPIDER computes beta from final_noise_scale
+    # so that scale**max_iters == final_noise_scale (set in optimize_step).
+    final_noise_scale: float = 0.1   # SPIDER final_noise_scale
+    beta_traj: float = 0.7           # fallback if final_noise_scale <= 0
 
     # Per-horizon-step log-space annealing (SPIDER first_/last_ctrl_noise_scale).
-    # LOW noise on the near-term step (h=0 — about to execute, want plan[0]
-    # to converge tightly between iters) and HIGH noise on the far horizon
-    # end (h=H-1 — exploration of the unknown future).
-    first_step_noise_scale: float = 0.3
-    last_step_noise_scale: float = 1.0
+    # LOW noise on the near-term step, HIGH noise on the far horizon end.
+    first_step_noise_scale: float = 0.5   # SPIDER first_ctrl_noise_scale
+    last_step_noise_scale: float = 1.0    # SPIDER last_ctrl_noise_scale
 
-    # Per-component noise std (in ctrl units).
-    finger_noise_std: float = 0.15   # rad  (~9°) per joint per knot
-    wrist_noise_std: float = 0.04    # rad axis-angle (~2.3°)
+    # Per-component noise std (in ctrl units). SPIDER joint 0.15, pos/rot 0.03.
+    finger_noise_std: float = 0.15   # rad per joint per knot
+    wrist_noise_std: float = 0.03    # rad axis-angle
 
     # Action clipping
     wrist_delta_clip: float = 0.05   # rad axis-angle
@@ -180,18 +184,31 @@ def optimize_step(
     # Finger qvel reference for the qvel deviation penalty: per-horizon-step
     # finite diff of the finger qpos reference. Skips wrist (mocap-driven)
     # and cube (penalizing cube velocity blocks in-hand rotation).
-    ref_dt = cfg.n_substeps * 0.002
+    ref_dt = cfg.n_substeps * cfg.sim_dt
     ref_finger_qvel = np.zeros_like(ref_qpos[..., 7:27])
     if ref_qpos.shape[0] > 1:
         ref_finger_qvel[:-1] = (ref_qpos[1:, 7:27] - ref_qpos[:-1, 7:27]) / ref_dt
         ref_finger_qvel[-1] = ref_finger_qvel[-2]
 
+    # Per-tick reference cube rotation increment for the cube_angvel term.
+    # Only needed when that term is active. dt folds into the weight, so this
+    # is the raw per-tick rotation vector (not divided by ref_dt).
+    ref_cube_rotvec = (
+        rotvec_from_quat_seq(ref_cube_quat) if cfg.weights.cube_angvel > 0.0
+        else None
+    )
+
     info = {
         "rew_max": [], "rew_mean": [], "frac_terminated": [],
         "terms": {k: [] for k in TERM_NAMES},
     }
+    # SPIDER global-noise anneal: beta s.t. beta**max_iters == final_noise_scale.
+    if cfg.final_noise_scale > 0.0 and cfg.max_iters > 0:
+        beta = cfg.final_noise_scale ** (1.0 / cfg.max_iters)
+    else:
+        beta = cfg.beta_traj
     for it in range(cfg.max_iters):
-        global_scale = cfg.beta_traj ** it
+        global_scale = beta ** it
         samples = _sample_actions(plan, cfg, global_scale, rng)
 
         env.snapshot_world_into_batch()
@@ -213,6 +230,7 @@ def optimize_step(
             actions=samples,
             weights=cfg.weights,
             contact_target_per_step=contact_target_per_step,
+            ref_cube_rotvec=ref_cube_rotvec,
         )
         weights = _topk_softmax(rews, cfg.top_frac, cfg.softmax_temp)
         plan = (weights[:, None, None] * samples).sum(axis=0)

@@ -45,6 +45,33 @@ CUBE_GEOM = "tracked_cube_geom"
 WRIST_MOCAP = "wrist_mocap"
 CUBE_FREEJOINT = "cube_freejoint"
 
+# Default sim timestep. SPIDER-matched: 0.01 (their setup_mj_model). Was 0.002.
+DEFAULT_SIM_DT = 0.01
+
+# SPIDER contact model (spider/simulators/mjwp.py setup_mj_model + generate_xml):
+#   - soft contacts ("softer contact for sim2real"): solimp dmin=0, width=0.03
+#   - condim 4 on the cube (torsional friction active → grip resists cube spin;
+#     ours was 3, which let the cube pivot freely on a fingertip)
+#   - object friction [1, 1, 0.1] (torsional 1.0 active at condim 4)
+# These are the levers SPIDER uses *instead of* domain randomization.
+SPIDER_SOLIMP = [0.0, 0.95, 0.03, 0.5, 2.0]
+SPIDER_FRICTION = [1.0, 1.0, 0.1]
+SPIDER_CUBE_CONDIM = 4
+
+
+def apply_spider_physics(model) -> None:
+    """Mutate `model` in place to SPIDER's soft-contact + torsional-friction
+    setup on the cube and fingertip geoms. See SPIDER_* constants above."""
+    cube_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, CUBE_GEOM)
+    tip_gids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, n)
+                for n in TIP_GEOMS]
+    # condim of a contact is max(geom1, geom2), so setting the cube to 4 makes
+    # every cube↔finger contact condim 4.
+    model.geom_condim[cube_gid] = SPIDER_CUBE_CONDIM
+    for gid in [cube_gid, *tip_gids]:
+        model.geom_solimp[gid] = SPIDER_SOLIMP
+        model.geom_friction[gid] = SPIDER_FRICTION
+
 
 @dataclass
 class EnvIds:
@@ -77,11 +104,41 @@ def quat_mul_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     ])
 
 
+def slerp_wxyz(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
+    """Spherical interpolation between wxyz quaternions (alpha in [0,1])."""
+    q0 = np.asarray(q0, dtype=float); q1 = np.asarray(q1, dtype=float)
+    d = float(np.dot(q0, q1))
+    if d < 0.0:
+        q1 = -q1; d = -d
+    if d > 0.9995:                      # nearly parallel → normalized lerp
+        q = q0 + alpha * (q1 - q0)
+        return q / np.linalg.norm(q)
+    theta = np.arccos(d)
+    s = np.sin(theta)
+    return (np.sin((1.0 - alpha) * theta) * q0 + np.sin(alpha * theta) * q1) / s
+
+
 class CpuEnv:
     """Sequential CPU rollout env. Owns 1 world + N batch MjData."""
 
-    def __init__(self, num_samples: int, sim_dt: float = 0.002):
+    def __init__(self, num_samples: int, sim_dt: float = DEFAULT_SIM_DT,
+                 spider_physics: bool = True):
         self.model, _ = compile_dyn(sim_dt=sim_dt)
+        # Match MjwpEnv's solver config so a cpu rollout compares apples-to-
+        # apples with an mjwp-planned one. Findings (2026-05): integrator and
+        # iteration count are no-ops for this model (implicit-fast ≡ Euler with
+        # no passive damping; the solver converges well under 20 iters), but
+        # impratio IS real — mujoco_warp does NOT honor impratio (its Option
+        # has no such field; it behaves as impratio=1), while the XML asks for
+        # 10. Leaving cpu at 10 ran *stiffer friction* than the GPU planner.
+        # Matching to 1 isolates the residual gap to float32-vs-float64 +
+        # warp's separate solver implementation (which is not configurable).
+        self.model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+        self.model.opt.iterations = 20
+        self.model.opt.ls_iterations = 50
+        self.model.opt.impratio = 1.0
+        if spider_physics:
+            apply_spider_physics(self.model)
         self.num_samples = num_samples
         self.world = mujoco.MjData(self.model)
         self.batch = [mujoco.MjData(self.model) for _ in range(num_samples)]
@@ -92,7 +149,6 @@ class CpuEnv:
         if self.model.nu != N_FINGER_CTRL:
             raise ValueError(f"Model nu={self.model.nu}, expected "
                              f"{N_FINGER_CTRL}")
-        self.ctrl_bias = np.zeros(N_FINGER_CTRL, dtype=np.float64)
 
     def _resolve_ids(self) -> EnvIds:
         m = self.model
@@ -117,21 +173,6 @@ class CpuEnv:
             finger_act_hi=finger_hi,
         )
 
-    # ── closure-bias ─────────────────────────────────────────────────────
-
-    def set_closure_bias(self, bias_rad: float) -> None:
-        self.ctrl_bias = bias_rad * self._flexion_closure_direction()
-
-    def _flexion_closure_direction(self) -> np.ndarray:
-        d = np.zeros(N_FINGER_CTRL, dtype=np.float64)
-        for i in range(N_FINGER_CTRL):
-            lo, hi = self.model.jnt_range[i + 1]   # +1 skips hand freejoint
-            if lo >= 0.0 and hi > 0.0:
-                d[i] = 1.0
-            elif hi <= 0.0 and lo < 0.0:
-                d[i] = -1.0
-        return d
-
     # ── world I/O ─────────────────────────────────────────────────────────
 
     def set_world_state(self, hand_qpos: np.ndarray, cube_pose7: np.ndarray,
@@ -152,7 +193,7 @@ class CpuEnv:
 
     def warmup_grasp(self, cube_pose7: np.ndarray, finger_ctrl: np.ndarray,
                      ref_wrist_pos: np.ndarray, ref_wrist_quat: np.ndarray,
-                     n_steps: int, closure_bias: float = 0.0) -> None:
+                     n_steps: int) -> None:
         """SPIDER-style virtual-stick initial grasp via *kinematic pin*: the
         cube qpos is overwritten and its qvel zeroed after every substep so
         fingers settle around a stationary cube. After warmup the cube is
@@ -162,8 +203,6 @@ class CpuEnv:
         cube_qadr = self.ids.cube_qadr
         cube_dofadr = self.ids.cube_dofadr
         ctrl = np.asarray(finger_ctrl, dtype=np.float64).copy()
-        if closure_bias > 0.0:
-            ctrl += closure_bias * self._flexion_closure_direction()
         ctrl = np.clip(ctrl, self.ids.finger_act_lo, self.ids.finger_act_hi)
         self.world.qpos[cube_qadr : cube_qadr + N_CUBE_QPOS] = cube_pose7
         self.world.qvel[cube_dofadr : cube_dofadr + 6] = 0.0
@@ -180,7 +219,7 @@ class CpuEnv:
     def _apply_action_to_data(self, data: mujoco.MjData, action: np.ndarray,
                               ref_wrist_pos: np.ndarray,
                               ref_wrist_quat: np.ndarray) -> None:
-        finger_ctrl = np.clip(action[SLICE_FINGER] + self.ctrl_bias,
+        finger_ctrl = np.clip(action[SLICE_FINGER],
                               self.ids.finger_act_lo, self.ids.finger_act_hi)
         delta = action[SLICE_WRIST]
         wrist_quat = quat_mul_wxyz(ref_wrist_quat, axis_angle_to_quat_wxyz(delta))
@@ -189,10 +228,35 @@ class CpuEnv:
         data.mocap_quat[self.ids.wrist_mocap] = wrist_quat
 
     def step_world(self, action: np.ndarray, ref_wrist_pos: np.ndarray,
-                   ref_wrist_quat: np.ndarray, n_substeps: int) -> None:
-        self._apply_action_to_data(self.world, action, ref_wrist_pos, ref_wrist_quat)
-        for _ in range(n_substeps):
+                   ref_wrist_quat: np.ndarray, n_substeps: int,
+                   next_action: np.ndarray | None = None,
+                   next_ref_wrist_pos: np.ndarray | None = None,
+                   next_ref_wrist_quat: np.ndarray | None = None,
+                   record_stride: int = 0):
+        """Advance the world one control step.
+
+        If `next_*` are given, the applied control + reference wrist are linearly
+        interpolated (SLERP for the wrist quat) from this control step toward the
+        next across the n_substeps — a smooth control spline instead of a
+        0.4 s zero-order-hold staircase. Returns a dense (n_rec, 34) array of
+        [hand_qpos(27), cube_pose7] when record_stride>0, else None."""
+        a1 = action if next_action is None else next_action
+        p1 = ref_wrist_pos if next_ref_wrist_pos is None else next_ref_wrist_pos
+        q1 = ref_wrist_quat if next_ref_wrist_quat is None else next_ref_wrist_quat
+        rec = [] if record_stride > 0 else None
+        for s in range(n_substeps):
+            alpha = s / n_substeps
+            a = (1.0 - alpha) * action + alpha * a1
+            rp = (1.0 - alpha) * ref_wrist_pos + alpha * p1
+            rq = slerp_wxyz(ref_wrist_quat, q1, alpha)
+            self._apply_action_to_data(self.world, a, rp, rq)
             mujoco.mj_step(self.model, self.world)
+            if rec is not None and (s % record_stride == 0):
+                rec.append(self.world.qpos[:N_HAND_QPOS + N_CUBE_QPOS].copy())
+        if rec is not None:
+            rec.append(self.world.qpos[:N_HAND_QPOS + N_CUBE_QPOS].copy())
+            return np.asarray(rec)
+        return None
 
     # ── batched rollout ───────────────────────────────────────────────────
 

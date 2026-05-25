@@ -97,19 +97,40 @@ def _load_stage2(session_dir: Path, cube_shift: np.ndarray | None):
     return qpos, cube_play, cube_shifted, timeline
 
 
-def _load_stage3(session_dir: Path):
+def _load_stage3(session_dir: Path, tag: str | None = None, dense: bool = True):
     """Returns (qpos, cube_sim, cube_ref_or_none, timeline). Prefers
     `cube_ref_used` from the dynamic npz (matches dynamic's frame count
-    even with --time-scale); falls back to Stage 2's cube_pose_used."""
-    dyn_path = session_dir / "retargeted_sequence_dynamic.npz"
+    even with --time-scale); falls back to Stage 2's cube_pose_used.
+
+    `tag` selects retargeted_sequence_dynamic__<tag>.npz (a tagged sweep
+    run); None loads the canonical retargeted_sequence_dynamic.npz.
+    `dense` uses the per-substep dense trajectory (smooth playback) if the
+    npz has one; otherwise falls back to the per-control-step trajectory."""
+    dyn_name = (f"retargeted_sequence_dynamic__{tag}.npz" if tag
+                else "retargeted_sequence_dynamic.npz")
+    dyn_path = session_dir / dyn_name
     if not dyn_path.exists():
         raise FileNotFoundError(f"missing {dyn_path}")
     dyn = np.load(dyn_path)
-    qpos = np.asarray(dyn["retargeted_qpos"], dtype=float)
-    cube_sim = np.asarray(dyn["cube_traj"], dtype=float)
-    timeline = np.asarray(dyn["timeline"], dtype=float)
+    coarse_timeline = np.asarray(dyn["timeline"], dtype=float)
+    if dense and "dense_qpos" in dyn.files:
+        qpos = np.asarray(dyn["dense_qpos"], dtype=float)
+        cube_sim = np.asarray(dyn["dense_cube"], dtype=float)
+        timeline = np.asarray(dyn["dense_timeline"], dtype=float)
+        print(f"  dense playback: {qpos.shape[0]} frames "
+              f"({1.0/np.diff(timeline).mean():.0f} fps)")
+    else:
+        qpos = np.asarray(dyn["retargeted_qpos"], dtype=float)
+        cube_sim = np.asarray(dyn["cube_traj"], dtype=float)
+        timeline = coarse_timeline
     if "cube_ref_used" in dyn.files:
         cube_ref = np.asarray(dyn["cube_ref_used"], dtype=float)
+        # Map the coarse ghost onto the (possibly dense) playback timeline by
+        # nearest control-step in time, so the ghost stays aligned.
+        if cube_ref.shape[0] != qpos.shape[0]:
+            idx = np.clip(np.searchsorted(coarse_timeline, timeline) - 1,
+                          0, cube_ref.shape[0] - 1)
+            cube_ref = cube_ref[idx]
     else:
         ref_path = session_dir / "retargeted_sequence.npz"
         cube_ref = (
@@ -127,17 +148,18 @@ def _load_stage3(session_dir: Path):
 
 
 def replay(session_dir: Path, *, speed: float, show_ref: bool, loop: bool,
-           stage2: bool, cube_shift: np.ndarray | None):
+           stage2: bool, cube_shift: np.ndarray | None, tag: str | None = None,
+           dense: bool = True):
     if stage2:
         qpos, cube_play, cube_shifted, timeline = _load_stage2(session_dir, cube_shift)
         cube_ref_ghost = None  # in stage2 mode, "ref" overlay would equal cube_play
         mode_label = f"stage2  shift={cube_shift if cube_shift is not None else 'none'}"
     else:
-        qpos, cube_play, cube_ref_ghost, timeline = _load_stage3(session_dir)
+        qpos, cube_play, cube_ref_ghost, timeline = _load_stage3(session_dir, tag, dense)
         if not show_ref:
             cube_ref_ghost = None
         cube_shifted = None
-        mode_label = "stage3 (dynamic)"
+        mode_label = f"stage3 (dynamic)  tag={tag if tag else 'canonical'}"
 
     N = qpos.shape[0]
     model = mujoco.MjModel.from_xml_path(str(PHYSICS_XML))
@@ -193,6 +215,13 @@ def main():
     p.add_argument("--stage2", action="store_true",
                    help="replay the Stage 2 kinematic IK output "
                         "(retargeted_sequence.npz) instead of the dynamic npz")
+    p.add_argument("--tag", type=str, default=None,
+                   help="replay a tagged sweep run "
+                        "(retargeted_sequence_dynamic__<tag>.npz). "
+                        "Ignored with --stage2.")
+    p.add_argument("--no-dense", dest="dense", action="store_false",
+                   help="play the per-control-step trajectory instead of the "
+                        "dense per-substep one (coarse/jumpy; for debugging).")
     p.add_argument("--cube-shift", type=float, nargs=3, default=None,
                    metavar=("X", "Y", "Z"),
                    help="wrist-frame shift (m) to preview as a green ghost "
@@ -206,7 +235,8 @@ def main():
         print("  [note] --cube-shift ignored without --stage2")
         shift = None
     replay(args.session_dir, speed=args.speed, show_ref=args.show_ref,
-           loop=args.loop, stage2=args.stage2, cube_shift=shift)
+           loop=args.loop, stage2=args.stage2, cube_shift=shift, tag=args.tag,
+           dense=args.dense)
 
 
 if __name__ == "__main__":

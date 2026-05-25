@@ -30,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 
@@ -44,13 +45,20 @@ from scripts.retargeting.dynamic_retargeting.cpu_env import (
 from scripts.retargeting.dynamic_retargeting.mppi import MPPIConfig, optimize_step
 from scripts.retargeting.dynamic_retargeting.reward import RewardWeights, TERM_NAMES
 
+# Record a dense world state every RECORD_STRIDE substeps (for smooth replay).
+# At sim_dt=0.01 this is one frame per 0.02s ≈ 50 fps.
+RECORD_STRIDE = 2
 
-def _build_env(backend: str, num_samples: int):
+
+def _build_env(backend: str, num_samples: int, sim_dt: float,
+               spider_physics: bool):
     if backend == "cpu":
-        return CpuEnv(num_samples=num_samples)
+        return CpuEnv(num_samples=num_samples, sim_dt=sim_dt,
+                      spider_physics=spider_physics)
     if backend == "mjwp":
         from scripts.retargeting.dynamic_retargeting.mjwp_env import MjwpEnv
-        return MjwpEnv(num_samples=num_samples)
+        return MjwpEnv(num_samples=num_samples, sim_dt=sim_dt,
+                       spider_physics=spider_physics)
     raise ValueError(f"unknown backend: {backend}")
 
 
@@ -126,20 +134,79 @@ def _resample_reference(
     return new_qpos, new_cube, new_contact, new_timeline
 
 
+def _resample_reference_to_dt(
+    qpos_ref: np.ndarray,                  # (N, 27)
+    cube_ref: np.ndarray,                  # (N, 7) wxyz
+    contact_target: np.ndarray | None,     # (N, 5, 3) cube-frame, NaN allowed
+    timeline: np.ndarray,                  # (N,) absolute seconds
+    target_dt: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
+    """Resample the reference onto a uniform `target_dt` grid (in real time).
+
+    This makes one MPC tick = one reference frame = `target_dt` of simulation,
+    so control granularity (ctrl_dt = n_substeps·sim_dt) matches SPIDER's
+    decoupled timing. Downsamples (coarse control) when target_dt > native
+    ref_dt; upsamples otherwise. Quaternions SLERP, everything else linear;
+    contact targets stay NaN where either bracketing native frame is NaN.
+    """
+    from scipy.spatial.transform import Rotation as R, Slerp
+    t_in = np.asarray(timeline, dtype=float)
+    N = qpos_ref.shape[0]
+    if N < 2:
+        return qpos_ref, cube_ref, contact_target, timeline
+    t0, t1 = float(t_in[0]), float(t_in[-1])
+    M = max(2, int(np.floor((t1 - t0) / target_dt)) + 1)
+    t_out = t0 + target_dt * np.arange(M)
+    t_out = np.clip(t_out, t0, t1)
+
+    new_qpos = np.zeros((M, 27), dtype=np.float64)
+    for j in (0, 1, 2, *range(7, 27)):
+        new_qpos[:, j] = np.interp(t_out, t_in, qpos_ref[:, j])
+    wrist_xyzw = qpos_ref[:, [4, 5, 6, 3]]
+    wq = Slerp(t_in, R.from_quat(wrist_xyzw))(t_out).as_quat()
+    new_qpos[:, 3] = wq[:, 3]
+    new_qpos[:, 4:7] = wq[:, :3]
+
+    new_cube = np.zeros((M, 7), dtype=np.float64)
+    for j in range(3):
+        new_cube[:, j] = np.interp(t_out, t_in, cube_ref[:, j])
+    cube_xyzw = cube_ref[:, [4, 5, 6, 3]]
+    cq = Slerp(t_in, R.from_quat(cube_xyzw))(t_out).as_quat()
+    new_cube[:, 3] = cq[:, 3]
+    new_cube[:, 4:7] = cq[:, :3]
+
+    new_contact = None
+    if contact_target is not None:
+        F = contact_target.shape[1]
+        new_contact = np.full((M, F, 3), np.nan, dtype=np.float64)
+        for f in range(F):
+            valid = ~np.isnan(contact_target[:, f, 0])
+            for c in range(3):
+                vals = contact_target[:, f, c]
+                interp = np.interp(t_out, t_in, np.where(valid, vals, 0.0))
+                # mark NaN where either bracketing native frame was invalid
+                left = np.searchsorted(t_in, t_out, side="right") - 1
+                left = np.clip(left, 0, N - 2)
+                ok = valid[left] & valid[left + 1]
+                new_contact[ok, f, c] = interp[ok]
+    return new_qpos, new_cube, new_contact, t_out
+
+
 def run_session(
     session_dir: Path,
     *, force: bool, cfg: MPPIConfig, seed: int,
-    warmup_steps: int = 50, warmup_closure: float = 0.0,
-    loop_closure: float = 0.0,
+    warmup_steps: int = 50,
     backend: str = "cpu",
     time_scale: int = 1,
     max_ticks: int = 0,
-    stale_rotation_window_s: float = 0.0,
-    stale_rotation_deg: float = 5.0,
+    tag: str | None = None,
+    spider_physics: bool = True,
 ) -> None:
     retarget_path = session_dir / "retargeted_sequence.npz"
     contact_path = session_dir / "contact_sequence.npz"
-    out_path = session_dir / "retargeted_sequence_dynamic.npz"
+    out_name = (f"retargeted_sequence_dynamic__{tag}.npz" if tag
+                else "retargeted_sequence_dynamic.npz")
+    out_path = session_dir / out_name
 
     if not retarget_path.exists():
         raise FileNotFoundError(
@@ -174,6 +241,19 @@ def run_session(
               f"{N_orig} → {qpos_ref.shape[0]} frames; per-tick Δref / {time_scale}, "
               f"total task time × {time_scale})")
 
+    # Control-rate decoupling (SPIDER-style): one MPC tick = one control step =
+    # ctrl_dt = n_substeps · sim_dt. Resample the reference onto that grid so a
+    # tick is real-time-correct and control is as coarse as SPIDER's (0.4s),
+    # which is the key robustness lever (no twitchy knife-edge solutions).
+    ctrl_dt = cfg.n_substeps * cfg.sim_dt
+    native_dt = float(np.diff(timeline).mean()) if len(timeline) > 1 else ctrl_dt
+    N_native = qpos_ref.shape[0]
+    qpos_ref, cube_ref, contact_target_per_frame, timeline = _resample_reference_to_dt(
+        qpos_ref, cube_ref, contact_target_per_frame, timeline, ctrl_dt)
+    print(f"  ctrl_dt={ctrl_dt:.3f}s (= {cfg.n_substeps}·{cfg.sim_dt}); reference "
+          f"resampled {N_native} frames @ {native_dt*1000:.0f}ms → "
+          f"{qpos_ref.shape[0]} ctrl steps @ {ctrl_dt*1000:.0f}ms")
+
     N = qpos_ref.shape[0]
     H = cfg.horizon_steps
     qpos_ref_padded = _pad_reference(qpos_ref, N + H)
@@ -192,11 +272,9 @@ def run_session(
           f" substeps={cfg.n_substeps}")
     print(f"  noise std: finger={cfg.finger_noise_std}  wrist={cfg.wrist_noise_std}")
 
-    print(f"  backend: {backend}")
-    env = _build_env(backend, cfg.num_samples)
+    print(f"  backend: {backend}  spider_physics: {spider_physics}")
+    env = _build_env(backend, cfg.num_samples, cfg.sim_dt, spider_physics)
     env.set_world_state(qpos_ref[0], cube_ref[0])
-    if loop_closure > 0.0:
-        env.set_closure_bias(loop_closure)
 
     # Kinematic-pin warmup: pin cube at ref[0], step physics so fingers
     # settle into a grip. After this the cube is released and runs free.
@@ -207,10 +285,8 @@ def run_session(
             ref_wrist_pos=qpos_ref[0, 0:3],
             ref_wrist_quat=qpos_ref[0, 3:7],
             n_steps=warmup_steps,
-            closure_bias=warmup_closure,
         )
-        print(f"  warmup grasp: {warmup_steps} substeps with cube pinned  "
-              f"closure_bias={warmup_closure:.3f} rad")
+        print(f"  warmup grasp: {warmup_steps} substeps with cube pinned")
 
     rng = np.random.default_rng(seed)
 
@@ -218,6 +294,10 @@ def run_session(
     cube_traj = np.zeros((N, 7), dtype=np.float64)
     ctrl_traj = np.zeros((N, N_FINGER_CTRL), dtype=np.float64)
     wrist_delta_traj = np.zeros((N, N_WRIST_DELTA), dtype=np.float64)
+    # Dense per-substep trajectory for smooth replay (shows the true continuous
+    # motion within each 0.4s control step instead of one teleporting frame).
+    dense_frames: list[np.ndarray] = []
+    dense_dt = cfg.sim_dt * max(1, RECORD_STRIDE)
     rew_max_log, rew_mean_log = [], []
     pos_err_history = np.zeros(N, dtype=np.float64)
     rot_err_history = np.zeros(N, dtype=np.float64)
@@ -259,12 +339,22 @@ def run_session(
         )
 
         action = plan[0]
-        env.step_world(
+        # Interpolate the applied control toward the next control step (plan[1]
+        # + next reference wrist) across the substeps — smooth spline, not a
+        # 0.4s staircase — and record dense intermediate states for replay.
+        nxt = 1 if H > 1 else 0
+        dense = env.step_world(
             action=action,
             ref_wrist_pos=ref_wrist_pos_h[0],
             ref_wrist_quat=ref_wrist_quat_h[0],
             n_substeps=cfg.n_substeps,
+            next_action=plan[nxt],
+            next_ref_wrist_pos=ref_wrist_pos_h[nxt],
+            next_ref_wrist_quat=ref_wrist_quat_h[nxt],
+            record_stride=RECORD_STRIDE,
         )
+        if dense is not None:
+            dense_frames.append(dense)
 
         qpos_traj[t] = env.world.qpos[:N_FINGER_CTRL + 7]
         cube_traj[t] = env.get_world_cube_pose7()
@@ -304,30 +394,6 @@ def run_session(
                 f"{k}={info['terms'][k][-1]:+6.2f}" for k in TERM_NAMES)
             print(f"           terms: {terms_str}")
 
-        # Stale-rotation early stop.
-        if stale_rotation_window_s > 0:
-            dt = float(np.diff(timeline).mean()) if len(timeline) > 1 else 0.05
-            win = max(2, int(stale_rotation_window_s / dt))
-            if t >= win:
-                sim_q0 = cube_traj[t - win, 3:7]
-                sim_q1 = cube_traj[t, 3:7]
-                ref_q0 = cube_ref[t - win, 3:7]
-                ref_q1 = cube_ref[t, 3:7]
-                sim_rot = np.degrees(2 * np.arccos(np.clip(
-                    abs(np.dot(sim_q0, sim_q1)), -1, 1)))
-                ref_rot = np.degrees(2 * np.arccos(np.clip(
-                    abs(np.dot(ref_q0, ref_q1)), -1, 1)))
-                if sim_rot < stale_rotation_deg and ref_rot > 3 * stale_rotation_deg:
-                    print(f"  [terminated] stale rotation at t={t}: "
-                          f"sim rotated {sim_rot:.1f}° in last {stale_rotation_window_s}s "
-                          f"vs ref {ref_rot:.1f}°. MPC is stuck.")
-                    cube_traj = cube_traj[: t + 1]
-                    qpos_traj = qpos_traj[: t + 1]
-                    ctrl_traj = ctrl_traj[: t + 1]
-                    wrist_delta_traj = wrist_delta_traj[: t + 1]
-                    timeline = timeline[: t + 1]
-                    break
-
     elapsed = time.perf_counter() - t_start
     print(f"  Done in {elapsed:.1f}s ({len(timeline)/elapsed:.2f} ticks/s).")
 
@@ -344,9 +410,46 @@ def run_session(
     # frame count matches the dynamic trajectory even with --time-scale.
     cube_ref_used = cube_ref_padded[:K].copy()
     qpos_ref_used = qpos_ref_padded[:K].copy()
-    np.savez_compressed(
-        out_path,
+
+    # Dense (sub-control-step) trajectory for smooth replay. Each control step
+    # contributed (n_substeps/RECORD_STRIDE + 1) frames of [hand27, cube7].
+    if dense_frames:
+        dense = np.concatenate(dense_frames[:K], axis=0)        # (D, 34)
+        dense_qpos = dense[:, :27]
+        dense_cube = dense[:, 27:34]
+        dense_timeline = float(timeline[0]) + dense_dt * np.arange(dense.shape[0])
+    else:
+        dense_qpos = dense_cube = dense_timeline = None
+
+    w = cfg.weights
+    run_config = {
+        "tag": tag,
+        "backend": backend,
+        "seed": seed,
+        "num_samples": cfg.num_samples,
+        "iters": cfg.max_iters,
+        "horizon": cfg.horizon_steps,
+        "substeps": cfg.n_substeps,
+        "sim_dt": cfg.sim_dt,
+        "ctrl_dt": cfg.n_substeps * cfg.sim_dt,
+        "spider_physics": spider_physics,
+        "time_scale": time_scale,
+        "warmup_steps": warmup_steps,
+        "finger_noise": cfg.finger_noise_std,
+        "wrist_noise": cfg.wrist_noise_std,
+        "terminal_scale": w.terminal_scale,
+        "weights": {
+            "cube_pos": w.cube_pos, "cube_quat": w.cube_quat,
+            "finger_qpos": w.finger_qpos, "contact": w.contact,
+            "wrist_delta": w.wrist_delta, "qvel": w.qvel,
+            "cube_angvel": w.cube_angvel,
+        },
+        "wall_time_s": round(elapsed, 1),
+        "ticks_per_s": round(len(timeline) / elapsed, 3) if elapsed > 0 else 0.0,
+    }
+    save_kwargs = dict(
         timeline=timeline,
+        run_config=np.array(json.dumps(run_config)),
         retargeted_qpos=qpos_traj,
         cube_traj=cube_traj,
         ctrl_traj=ctrl_traj,
@@ -361,6 +464,11 @@ def run_session(
         cube_ref_used=cube_ref_used,
         qpos_ref_used=qpos_ref_used,
     )
+    if dense_qpos is not None:
+        save_kwargs.update(
+            dense_qpos=dense_qpos, dense_cube=dense_cube,
+            dense_timeline=dense_timeline)
+    np.savez_compressed(out_path, **save_kwargs)
     print(f"  ── error summary ──")
     print(f"  cube pos err (mm):  mean={pos_err_history[:K].mean()*1000:5.1f}  "
           f"max={pos_err_history[:K].max()*1000:5.1f}")
@@ -375,17 +483,11 @@ def run_session(
 
 
 def _build_weights(args) -> RewardWeights:
-    presets = {
-        "default": RewardWeights(),
-        "object_heavy": RewardWeights(
-            cube_pos=3.0, cube_quat=1.0, finger_qpos=1.0,
-            contact=1.0, wrist_delta=0.5,
-        ),
-    }
-    w = presets.get(args.preset)
-    if w is None:
-        raise SystemExit(f"unknown --preset: {args.preset}; choices: {list(presets)}")
-    for field in ("cube_pos", "cube_quat", "finger_qpos", "contact", "wrist_delta", "qvel"):
+    """Start from the validated defaults (RewardWeights), apply any explicit
+    --w-* overrides on top."""
+    w = RewardWeights()
+    for field in ("cube_pos", "cube_quat", "finger_qpos", "contact",
+                  "wrist_delta", "qvel", "cube_angvel"):
         v = getattr(args, f"w_{field}", None)
         if v is not None:
             setattr(w, field, v)
@@ -399,12 +501,23 @@ def main():
     parser.add_argument("session_dirs", nargs="+", type=Path)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--num-samples", type=int, default=256)
-    parser.add_argument("--horizon", type=int, default=8)
-    parser.add_argument("--iters", type=int, default=8)
-    parser.add_argument("--substeps", type=int, default=25)
-    parser.add_argument("--preset", default="default",
-                        choices=["default", "object_heavy"])
+    parser.add_argument("--num-samples", type=int, default=1024,
+                        help="MPPI samples per iter (SPIDER-matched 1024).")
+    parser.add_argument("--horizon", type=int, default=4,
+                        help="Control steps in the planning horizon "
+                             "(SPIDER horizon/ctrl_dt = 1.6/0.4 = 4).")
+    parser.add_argument("--iters", type=int, default=16,
+                        help="MPPI refinement iters per step (SPIDER 16).")
+    parser.add_argument("--substeps", type=int, default=40,
+                        help="mj_step per control step. ctrl_dt = substeps·sim_dt "
+                             "(SPIDER 40·0.01 = 0.4s). The reference is resampled "
+                             "to this ctrl_dt.")
+    parser.add_argument("--sim-dt", type=float, default=0.01,
+                        help="Physics timestep (SPIDER 0.01; was 0.002).")
+    parser.add_argument("--no-spider-physics", dest="spider_physics",
+                        action="store_false",
+                        help="Disable SPIDER soft-contact + condim-4 physics "
+                             "(revert to the original hard contacts) for A/B.")
     parser.add_argument("--w-cube-pos", type=float, default=None)
     parser.add_argument("--w-cube-quat", type=float, default=None)
     parser.add_argument("--w-finger-qpos", type=float, default=None)
@@ -413,27 +526,20 @@ def main():
     parser.add_argument("--w-qvel", type=float, default=None,
                         help="Velocity penalty weight (per rad/s, m/s). "
                              "Encourages stable equilibrium states. Default 0.005.")
+    parser.add_argument("--w-cube-angvel", type=float, default=None,
+                        help="Cube angular-velocity (per-tick rotation "
+                             "increment) tracking weight. Default 0 (pure "
+                             "pose tracking). Raise it for motion/task-style "
+                             "tracking; pair with --w-cube-quat 0 to fully "
+                             "switch from absolute-pose to motion tracking "
+                             "(cube_pos still anchors position).")
     parser.add_argument("--terminal-scale", type=float, default=None,
                         help="Multiplier on the LAST horizon-step reward. "
                              "Default 3.0.")
-    parser.add_argument("--cube-pos-deadband", type=float, default=0.0,
-                        help="Wrist-frame radius (m) inside which cube_pos "
-                             "error is zero. Recommended ~0.02 for cube_pitch.")
-    parser.add_argument("--cube-pos-wall-start", type=float, default=0.0,
-                        help="Distance past the deadband (m) where the "
-                             "quadratic wall kicks in. e.g. 0.01 = 10 mm "
-                             "linear band before the wall. Default 0.")
-    parser.add_argument("--cube-pos-wall-scale", type=float, default=0.0,
-                        help="Quadratic penalty weight (per m²) past the "
-                             "wall threshold. e.g. 100 makes a 70 mm wall "
-                             "excess contribute ~0.49 per step vs 0.07 "
-                             "linear. Default 0 (no wall).")
     parser.add_argument("--finger-noise", type=float, default=None)
     parser.add_argument("--wrist-noise", type=float, default=None)
     parser.add_argument("--warmup-steps", type=int, default=50,
                         help="Kinematic-pin warmup substeps before MPPI starts.")
-    parser.add_argument("--warmup-closure", type=float, default=0.0)
-    parser.add_argument("--loop-closure", type=float, default=0.0)
     parser.add_argument("--drop-threshold", type=float, default=0.10,
                         help="Cube pos-error threshold (m) for resample-on-drop.")
     parser.add_argument("--backend", default="cpu", choices=["cpu", "mjwp"],
@@ -442,21 +548,20 @@ def main():
                         help="Integer reference-trajectory upsampling.")
     parser.add_argument("--max-ticks", type=int, default=0,
                         help="Cap MPC at this many ticks. 0 = full sequence.")
-    parser.add_argument("--stale-rotation-window", type=float, default=0.0,
-                        help="Early-stop if cube rotates less than "
-                             "--stale-rotation-deg over this many seconds.")
-    parser.add_argument("--stale-rotation-deg", type=float, default=5.0)
+    parser.add_argument("--tag", type=str, default=None,
+                        help="Suffix for the output npz: writes "
+                             "retargeted_sequence_dynamic__<tag>.npz instead "
+                             "of overwriting the canonical file. Use to keep "
+                             "sweep runs side by side for compare_dynamic.py.")
     args = parser.parse_args()
 
     weights = _build_weights(args)
-    weights.cube_pos_deadband_m = float(args.cube_pos_deadband)
-    weights.cube_pos_wall_start_m = float(args.cube_pos_wall_start)
-    weights.cube_pos_wall_scale = float(args.cube_pos_wall_scale)
     cfg = MPPIConfig(
         num_samples=args.num_samples,
         horizon_steps=args.horizon,
         max_iters=args.iters,
         n_substeps=args.substeps,
+        sim_dt=args.sim_dt,
         weights=weights,
         drop_threshold_m=args.drop_threshold,
     )
@@ -465,20 +570,19 @@ def main():
 
     print(f"  weights: cube_pos={weights.cube_pos}  cube_quat={weights.cube_quat}"
           f"  finger_qpos={weights.finger_qpos}  contact={weights.contact}"
-          f"  wrist_delta={weights.wrist_delta}")
+          f"  wrist_delta={weights.wrist_delta}  qvel={weights.qvel}"
+          f"  cube_angvel={weights.cube_angvel}")
 
     for d in args.session_dirs:
         print(f"\n{d.name}")
         run_session(
             d, force=args.force, cfg=cfg, seed=args.seed,
             warmup_steps=args.warmup_steps,
-            warmup_closure=args.warmup_closure,
-            loop_closure=args.loop_closure,
             backend=args.backend,
             time_scale=args.time_scale,
             max_ticks=args.max_ticks,
-            stale_rotation_window_s=args.stale_rotation_window,
-            stale_rotation_deg=args.stale_rotation_deg,
+            tag=args.tag,
+            spider_physics=args.spider_physics,
         )
 
 

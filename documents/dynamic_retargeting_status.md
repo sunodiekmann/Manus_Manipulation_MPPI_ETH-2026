@@ -2,23 +2,38 @@
 
 > Living handoff doc for the SPIDER-style retargeting pipeline on the `spider-rewrite`
 > branch. Supersedes the "Phase 4" status notes in `spider_rewrite_plan.md`.
-> Last updated: 2026-05-20.
+> Last updated: 2026-05-20 (recapture + cleanup session).
 
 ## TL;DR
 
 The offline retargeting pipeline (human cube manipulation → Tesollo DG-5F trajectory)
-works end-to-end. Stage 3 dynamic MPC now produces **real in-hand cube rotation**
-(cube_pitch tracks ~70° rotation and the pitch-and-return motion for the first ~170
-ticks). The remaining failure: on the hardest part of cube_pitch the cube drifts out of
-position, a finger loses its grip, and the cube drops. Diagnosis points to a **robot
-kinematic / motion-difficulty limit** (Tesollo reproducing a complex human regrip), not
-a pipeline bug.
+**works end-to-end and completes the full motion.** Stage 3 dynamic MPC produces real
+in-hand cube rotation that tracks the reference for the *entire* sequence with **no
+drop** — `frac_term=0.00` throughout on both validated motions:
 
-**The single most important fix this session: Stage 3 reverted from a virtual-stick
-cube (3 slide + 3 hinge Euler joints + position actuators) back to a real freejoint.**
-The Euler joints carried `armature=1e-4` + `frictionloss=1e-4` that tripled the cube's
-effective rotational inertia and added stiction — that was crippling rotation. The
-freejoint fixed it (rot_err at t=30 dropped ~18× : 25° → 1.4°).
+| motion | N (mjwp) | pos err mean / max | rot err mean / max | drop? |
+|---|---|---|---|---|
+| **cube_roll2**  | 512  | 24.8 / 51.0 mm | 3.1° / 47.8° | no |
+| **cube_pitch2** | 2048 | 11.3 / 27.2 mm | 1.3° /  9.3° | no |
+
+cube_pitch2 is the motion that **dropped at the hardest regrip in the prior session** —
+it now tracks cleanly to t=200. This falsifies the earlier "Tesollo kinematic limit"
+hypothesis: **it was the capture quality, not the robot.**
+
+**What actually fixed it (2026-05-20, recapture session):** the three motions were
+**re-recorded**, holding a **stable grasp for ~2 s at the start AND end**, moving
+**slower**, and **not sliding the fingers** on the cube. Because the motion is now
+robot-feasible, the whole stack of drop-era band-aids (cube_pos deadband + quadratic
+wall, closure-bias warmup/loop terms, stale-rotation early-stop) became unnecessary and
+was **deleted**. The validated weights are now the defaults.
+
+**Calibration offsets are now off by default-of-practice:** retargeting was run with
+`--no-offsets` (Stage 2) — the equality IK is robust without them and the hand cramps
+differently on the robot anyway, so the per-pose offsets weren't helping dynamically.
+
+(Prior load-bearing fix, still true: Stage 3 uses a **real freejoint cube**, not the
+virtual-stick 3-slide+3-hinge Euler joints whose `armature`/`frictionloss` had tripled
+the cube's rotational inertia and crippled rotation.)
 
 ## Pipeline shape (current)
 
@@ -44,22 +59,26 @@ Replay    replay_dynamic.py                --stage2 mode for kinematic; default 
 - `--cube-shift X Y Z` (wrist frame, metres): shifts the cube target before IK so fingers
   wrap a cube held away from the palm. Saved as `cube_shift` key. Stage 3 reads the
   already-shifted reference; **no Stage-3 shift flag**.
-- `--no-offsets`: zero both wrist + fingertip calibration offsets (diagnostic). Finding:
-  the kinematic result still looks good without offsets — the equality IK + interior snap
-  are robust, so the offsets are NOT a large error source. (Offsets still fine-tune exact
-  contact point, which can matter dynamically — A/B in Stage 3 to be sure.)
+- `--no-offsets`: zero both wrist + fingertip calibration offsets. **Now the working
+  default-of-practice** — the equality IK + interior snap are robust without them, and
+  the hand cramps differently on the robot than the human anyway, so the per-pose offsets
+  did not help dynamically. Both validated runs used `--no-offsets`.
 
 ### Stage 3 — sampling MPC (`dynamic_retargeting/`, `optimize_sequence_dynamic.py`)
 - **Real freejoint cube** (no virtual stick, no cube actuators). 23-dim action:
   `[20 finger ctrls, 3 wrist axis-angle delta]`. Wrist position pinned to ref;
   orientation = ref ⊗ exp(delta).
 - Backends: `cpu` (sequential MuJoCo) / `mjwp` (mujoco_warp GPU, CUDA-graph capture).
-- Kinematic-pin warmup: cube qpos overwritten + qvel zeroed each substep so fingers
-  settle into a grip before MPC; cube released after.
-- Reward terms (all weighted, terminal-scaled): `cube_pos` (deadband + quadratic wall),
+- Kinematic-pin warmup (`--warmup-steps`, default 50): cube qpos overwritten + qvel
+  zeroed each substep so fingers settle into a grip before MPC; cube released after.
+  Converts the Stage-2 kinematic "touch" pose into a force-closed physics grip so the
+  free cube isn't dropping on tick 0. **Kept** — both validated runs used it.
+- Reward terms (all weighted, terminal-scaled): `cube_pos` (plain world-frame L2),
   `cube_quat`, `finger_qpos`, `contact` (cube-frame relative), `wrist_delta`,
   `qvel` (**finger-qvel deviation from ref only** — wrist mocap-driven, cube must be free
-  to rotate).
+  to rotate). Validated default weights: cube_pos **0.3**, cube_quat **1.0**,
+  finger_qpos **0.2**, contact **1.5**, wrist_delta 0.5, qvel 0.005 — orientation-led
+  tracking with a strong contact term and a light qpos pull.
 - MPPI: per-component noise (finger/wrist), per-horizon-step log anneal
   (`first_step_noise 0.3 → last_step 1.0`, SPIDER convention: tight near-term, exploratory
   far-term), per-iter `beta_traj=0.7`, top-10% softmax (`temp=0.3`), zero-noise sample 0,
@@ -70,20 +89,25 @@ Replay    replay_dynamic.py                --stage2 mode for kinematic; default 
 | Flag | Default | Effect |
 |---|---|---|
 | `--backend mjwp` | cpu | GPU; required for N>128 |
-| `--num-samples` | 256 | per MPPI iter (use 2048 on GPU) |
+| `--num-samples` | 256 | per MPPI iter (512 used for roll, 2048 for pitch on GPU) |
 | `--iters` | 8 | MPPI iters per tick |
 | `--substeps` | 25 | mj_step per ref tick (sim_dt 0.002, ref_dt 0.05) |
-| `--horizon` | 8 | lookahead in ref ticks |
-| `--w-{cube-pos,cube-quat,finger-qpos,contact,wrist-delta,qvel}` | 1.0/0.3/0.3/1.0/0.5/0.005 | reward weights |
+| `--horizon` | 16 | lookahead in ref ticks (was 8; 16 is the validated default) |
+| `--w-{cube-pos,cube-quat,finger-qpos,contact,wrist-delta,qvel}` | 0.3/1.0/0.2/1.5/0.5/0.005 | reward weights (validated working config) |
 | `--terminal-scale` | 3 | multiplier on H-1 step reward |
-| `--cube-pos-deadband` | 0 | wrist-frame free-zone radius (m); ~0.02 for cube_pitch |
-| `--cube-pos-wall-start` | 0 | distance past deadband where quadratic wall starts |
-| `--cube-pos-wall-scale` | 0 | quadratic wall weight (per m²); ~1000 = hard wall |
 | `--time-scale` | 1 | integer reference upsample; K=2 halves Δref/tick, 2× task time |
 | `--max-ticks` | 0 | cap MPC ticks for fast diagnostics |
-| `--warmup-steps/--warmup-closure/--loop-closure` | 50/0/0 | grip warmup + persistent closure bias |
+| `--warmup-steps` | 50 | kinematic-pin grip warmup substeps |
 | `--finger-noise/--wrist-noise` | 0.15/0.04 | MPPI per-component noise std |
-| `--stale-rotation-window` | 0 | early-stop if rotation stalls |
+| `--drop-threshold` | 0.10 | cube pos-err (m) for resample-on-drop |
+
+The validated command for either motion (vary `--num-samples`):
+```
+.venv/bin/python -m scripts.retargeting.optimize_sequence_dynamic recordings/<session> \
+    --force --backend mjwp --num-samples 2048 --iters 8 --substeps 25 --horizon 16 \
+    --w-cube-pos 0.3 --w-cube-quat 1.0 --w-finger-qpos 0.2 --w-contact 1.5 --w-qvel 0.005
+```
+(the `--w-*` values now match the defaults, so a bare run reproduces them.)
 
 Stage 3 saves per-tick diagnostics in the npz: `pos_err_history`, `rot_err_history`,
 `iter_improvement_history`, `term_names`, `term_means_history`, plus `cube_ref_used` /
@@ -100,74 +124,79 @@ t=  N/total  rew=R (improv +I)  pos=Pmm  rot=D°  frac_term=F
 - `improv = rew_max[last iter] − rew_max[first iter]`: **positive = MPPI improved the plan
   this tick**. Per-tick metric; do NOT compare `rew` across ticks (different ref windows).
 - `frac_term`: fraction of rollout samples that dropped the cube; 1.0 = resample-on-drop
-  has no good samples (degenerate).
+  has no good samples (degenerate). On the validated runs this stays **0.00 throughout**.
 
-## Current results (cube_pitch, N=2048, iters=8, time-scale=2)
+## Current results (recapture session, 2026-05-20)
 
-- First ~170 output ticks: rot tracks to 70° and back, pos in/near the 20mm deadband.
-- ~t=180: cube position drifts past deadband → ring slips on the cube (cube-frame, not
-  world) → 2-finger grip becomes unstable → cube drops; pos blows to 200mm+.
-- `cube_pos` quadratic wall + higher contact weight delay but don't prevent the drop.
-- MPC **detects** the impending drop (cube_pos term spikes ~1 tick before pos actually
-  blows up) but has no recoverable plan — multiple terms spike together = unrecoverable
-  physical state, not an optimizer failure.
+Both motions complete the full sequence with `frac_term=0.00` at every tick — the cube is
+never dropped, and the per-term penalties stay flat (no end-of-run spike).
 
-## Diagnosis
+| motion | N | iters | horizon | pos err mean / max | rot err mean / max |
+|---|---|---|---|---|---|
+| cube_roll2  | 512  | 8 | 16 | 24.8 / 51.0 mm | 3.1° / 47.8° |
+| cube_pitch2 | 2048 | 8 | 16 | 11.3 / 27.2 mm | 1.3° /  9.3° |
 
-This is most likely a **robot capability limit**, not a pipeline bug:
-- The recorded human cube_pitch uses a fast multi-finger regrip.
-- Tesollo DG-5F (4 DOF/finger, box fingertips, short distal segments) can't articulate
-  fast enough to keep all fingers tracking their cube-frame contact points through the
-  peak-rotation regrip. One finger lags on the cube surface → grip destabilises.
-- Literature (SPIDER, HORA, OpenAI Rubik's, DexCap) succeeds on this class of task with
-  **anthropomorphic hands** (Shadow / Allegro / LEAP) that match human articulation, and
-  in several cases with **task-level rewards** rather than trajectory tracking.
+cube_pitch2 (which dropped at the hardest regrip last session) now tracks to t=200 with
+mean rot err **1.3°**. The dominant remaining penalty is `contact` (~-2.0 mean on pitch),
+i.e. the relative-contact target is the term with the most headroom — not a failure mode,
+just where tracking is loosest.
+
+## Diagnosis (resolved)
+
+The prior "robot kinematic limit" hypothesis was **wrong** — or at least not binding. The
+same Tesollo hand reproduces the recaptured cube_pitch with no drop. The real culprit was
+**capture quality**: the original recordings had fast multi-finger regrips and finger
+sliding that produced a reference no in-hand controller could track. Re-recording with a
+stable 2 s grasp at start/end, slower motion, and no finger sliding made the reference
+robot-feasible, and the existing pipeline tracks it.
+
+Practical takeaway for future captures: **the recording technique matters more than any
+reward knob.** Hold static grasps at the ends, move slowly, don't slide the fingers.
 
 ## Forward plan
 
-### 1. Recapture the three cube motions (next, by the user)
-Re-record cube_pitch / cube_roll / cube_yaw with:
-- A **static grasp at start and end** (clean entry/exit for MPC).
-- **Slower** motion (less Δref per tick → physics has time to track).
-- **Less extensive** rotation (smaller angle → less regrip demand).
-- **Easier finger gait** (avoid fast multi-finger regrips Tesollo can't reproduce).
+### 1. Re-run + eval cube_yaw2 (immediate)
+roll + pitch are validated. Run `optimize_sequence_dynamic` on `recordings/cube_yaw2`
+with the same command and confirm `frac_term=0.00` + low rot err. If it also passes, all
+three motions are done.
 
-Then re-run the pipeline once (Stage 2 → 2.5 → 3) and evaluate. This directly addresses
-the kinematic-limit hypothesis: an easier motion should be reproducible.
-
-### 2. If recapture isn't enough → task reward (planned, not yet implemented)
-Shift Stage 3 reward from **trajectory tracking** (match specific cube pose per frame) to
-**task / motion tracking**:
-- Keep `finger_qpos` and `contact` terms (still want robot to grip like the human).
-- Replace per-frame absolute `cube_pos`/`cube_quat` tracking with a reward on the **motion
-  itself** — e.g. cube angular velocity matches the reference rotation rate/axis, rather
-  than the cube being at an exact orientation at an exact frame.
-- Rationale: lets MPC find a Tesollo-feasible execution that achieves the same *motion*
-  without being pinned to the human's exact cube trajectory. This is the DexCap / HORA
-  approach and is well-supported in the literature for hand-mismatch retargeting.
-- The deadband + wall machinery on `cube_pos` already partially decouples position; the
-  task reward extends that idea to orientation/rotation.
+### 2. Task reward — now OPTIONAL (not needed for current results)
+Only pursue if a future, harder motion can't be tracked by trajectory following. Idea
+unchanged: keep `finger_qpos` + `contact`, reward the rotation *motion* (angular velocity
+/ axis) instead of exact per-frame cube pose (DexCap / HORA style). Lower priority now
+that trajectory tracking works on feasible captures.
 
 ### 3. Other levers if needed (lower priority)
-- Domain randomization in the rollout (SPIDER does this; we don't) for robustness.
+- Domain randomization in the rollout (SPIDER does this; we don't) for sim-to-real
+  robustness — relevant once we move toward hardware, not for sim tracking.
 - Friction tuning (cube torsional already bumped 0.02 → 0.3; `solref`/`solimp` unexplored).
-- Drop the calibration offsets entirely if the Stage-3 A/B (`--no-offsets`) shows they
-  don't help dynamically — one less pipeline component.
 
-## Session changelog (2026-05-20)
+## Session changelog (2026-05-20, recapture + cleanup)
+- **Recaptured all three motions** (stable 2 s grasp at start/end, slower, no finger
+  sliding). cube_roll2 + cube_pitch2 now track the full sequence with no drop.
+- Ran retargeting with **`--no-offsets`** — confirmed offsets aren't needed dynamically.
+- Promoted the validated weights to **defaults**: cube_pos 1.0→0.3, cube_quat 0.3→1.0,
+  finger_qpos 0.3→0.2, contact 1.0→1.5; `--horizon` default 8→16.
+- **Deleted the drop-era band-aids** (no longer needed; suno branch is the rollback):
+  - `cube_pos` deadband + quadratic wall (reward.py fields + `--cube-pos-deadband`,
+    `--cube-pos-wall-start`, `--cube-pos-wall-scale`); cube_pos is plain world-frame L2 again.
+  - closure bias: `set_closure_bias`/`_flexion_closure_direction`/`ctrl_bias` in both envs,
+    `--warmup-closure`, `--loop-closure`, `closure_bias` param on `warmup_grasp`.
+  - stale-rotation early-stop (`--stale-rotation-window`, `--stale-rotation-deg`).
+  - `object_heavy` preset + `--preset` flag (defaults now cover the validated config).
+  - **Kept**: `warmup_grasp` (touch→grip, both runs used it), resample-on-drop +
+    `--drop-threshold`, `--time-scale`, `--max-ticks`.
+
+### Prior changelog (2026-05-20, earlier — virtual-stick → freejoint session)
 - **Reverted virtual stick → real freejoint** in Stage 3 (cpu_env, mjwp_env, build_ik_scene,
   mppi, optimize_sequence_dynamic). Action 29-dim → 23-dim. This unlocked rotation.
-- Reward fixes earlier in session: flipped horizon noise schedule (0.3→1.0), qvel as
-  finger-deviation only, `terminal_scale` 10→3, `softmax_temp` 0.3, finger_qpos default 0.3.
+- Reward fixes: flipped horizon noise schedule (0.3→1.0), qvel as finger-deviation only,
+  `terminal_scale` 10→3, `softmax_temp` 0.3.
 - Added per-term reward breakdown + pos/rot/improvement logging + npz keys.
 - Added `--time-scale` (reference upsample) and `--max-ticks` (fast diagnostic cap).
-- Added `cube_pos` quadratic wall (`--cube-pos-wall-start/scale`).
 - Moved `--cube-shift` from Stage 3 to Stage 2 (IK re-solves fingers for the shifted cube).
-- Surface snap reworked to **interior-only** with 5mm margin in tesollo_target_mapping;
-  removed the bidirectional/spider_contact snap (it forced exterior fingers into contact
-  and killed the natural release/regrip pattern).
-- Added `--no-offsets` diagnostic flag to Stage 2.
-- replay_dynamic: `--stage2` mode + `--cube-shift` green-ghost preview + `cube_ref_used`
-  consumption (fixes time-scale frame mismatch).
+- Surface snap reworked to **interior-only** with 5mm margin in tesollo_target_mapping.
+- Added `--no-offsets` flag to Stage 2.
+- replay_dynamic: `--stage2` mode + `--cube-shift` green-ghost preview + `cube_ref_used`.
 - Cube torsional friction 0.02 → 0.3 in `assets/output_mocap_physics.xml`.
 ```

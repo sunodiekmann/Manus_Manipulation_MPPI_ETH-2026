@@ -12,6 +12,15 @@ over the horizon; higher reward = better (errors are negated).
     qvel        : -w_qv * ||finger_qvel_sim − finger_qvel_ref||   [rad/s]
                   (only finger DOFs — wrist is mocap-tracked, cube must be
                   free to rotate for in-hand-manipulation tasks)
+    cube_angvel : -w_av * ||rotvec_sim − rotvec_ref||             [rad/tick]
+                  per-tick cube rotation increment (∝ angular velocity;
+                  the dt folds into the weight). Tracks the rotation
+                  *motion* rather than the absolute orientation: the cube
+                  may drift in absolute pose as long as it turns at the
+                  reference rate/axis. Default weight 0 — opt in for a
+                  task-style reward; pair with --w-cube-quat 0 to fully
+                  switch from pose tracking to motion tracking (cube_pos
+                  still anchors position). See dynamic_retargeting_status.md.
 """
 from __future__ import annotations
 
@@ -24,36 +33,27 @@ from scripts.retargeting.dynamic_retargeting.cpu_env import SLICE_WRIST
 
 @dataclass
 class RewardWeights:
-    cube_pos: float = 1.0          # per metre
-    cube_quat: float = 0.3         # per rad
-    finger_qpos: float = 0.3       # per rad — soft pull to IK ref; the IK
+    # Defaults are the validated working config (cube_roll2 + cube_pitch2,
+    # 2026-05-21): orientation-led tracking with a strong contact term and a
+    # light finger_qpos pull. A bare Stage-3 run reproduces these results.
+    cube_pos: float = 0.5          # per metre
+    cube_quat: float = 0.7         # per rad
+    finger_qpos: float = 0.2       # per rad — soft pull to IK ref; the IK
                                    # pose is "touch", not "grasp", so a
                                    # heavy weight here actively fights
                                    # force-closure discovery
-    contact: float = 1.0           # per metre, summed over fingers
-    wrist_delta: float = 0.5       # per rad
+    contact: float = 1.8           # per metre, summed over fingers
+    wrist_delta: float = 0.3       # per rad
     qvel: float = 0.005            # per rad/s on finger qvel DEVIATION
                                    # from reference. Penalizing absolute
                                    # qvel (or wrist/cube qvel) blocks
                                    # in-hand rotation; restrict to finger
                                    # qvel deviation only.
-    cube_pos_deadband_m: float = 0.0
-    """If > 0, the cube_pos error is computed in *wrist frame* (so it
-    follows the hand) and the deadband-radius bubble around the reference
-    is free (no penalty). Outside the bubble, the existing cube_pos weight
-    applies to the surplus."""
-    cube_pos_wall_start_m: float = 0.0
-    """Distance *past the deadband* where the quadratic wall kicks in.
-    Wall_scale only applies when pos_dist > deadband + wall_start. Set to
-    e.g. 0.01 to leave a 10 mm linear-only band between the deadband and
-    the wall (so MPC has gradient room to recover before hitting the wall)."""
-    cube_pos_wall_scale: float = 0.0
-    """Quadratic penalty weight (per m²) past `wall_start`. Multiplied by
-    `cube_pos` like the linear term, so the effective penalty is
-    `cube_pos * (linear_excess + wall_scale * hard_excess²)`. Use when
-    "letting the cube drift" becomes a destabilising local optimum —
-    e.g. wall_scale=100 means at 70 mm beyond wall_start the quadratic
-    contribution per step is 0.49, dominating the linear term (0.07)."""
+    cube_angvel: float = 0.25       # per rad/tick on the cube per-tick
+                                   # rotation increment vs reference.
+                                   # Default 0 (pure pose tracking). Raise
+                                   # it (and optionally drop cube_quat) for
+                                   # motion/task-style tracking.
     terminal_scale: float = 3.0
     """Multiplier on the LAST horizon-step reward. Helps with myopic
     drift by making MPC care about where the cube ends up at horizon-end,
@@ -71,8 +71,49 @@ def _quat_rotate_vec(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     return v + w * t + np.cross(qv, t, axis=-1)
 
 
+def _quat_conj(q: np.ndarray) -> np.ndarray:
+    """Conjugate of wxyz quaternion(s). Broadcasts over leading dims."""
+    out = q.copy()
+    out[..., 1:] *= -1.0
+    return out
+
+
+def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product a ⊗ b for wxyz quaternions, broadcasting."""
+    aw, ax, ay, az = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    bw, bx, by, bz = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    return np.stack([
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ], axis=-1)
+
+
+def rotvec_from_quat_seq(q: np.ndarray) -> np.ndarray:
+    """Per-tick rotation vector (axis·angle) of a wxyz quaternion sequence.
+
+    q: (..., H, 4) → (..., H, 3). For step h the increment is the world-frame
+    rotation r = q[h+1] ⊗ conj(q[h]) converted to axis·angle; the last step
+    repeats the previous (forward-difference padding). World-frame and method
+    are identical for sim and reference, so ‖rotvec_sim − rotvec_ref‖ is a
+    well-posed angular-velocity-tracking error (the per-tick dt folds into the
+    reward weight)."""
+    q0 = q[..., :-1, :]
+    q1 = q[..., 1:, :]
+    r = _quat_mul(q1, _quat_conj(q0))
+    # Shortest-arc: force scalar part non-negative.
+    r = np.where(r[..., 0:1] < 0.0, -r, r)
+    w = np.clip(r[..., 0], -1.0, 1.0)
+    angle = 2.0 * np.arccos(w)                                  # (..., H-1)
+    s = np.sqrt(np.maximum(1.0 - w * w, 1e-12))
+    axis = r[..., 1:] / s[..., None]
+    rotvec = axis * angle[..., None]                            # (..., H-1, 3)
+    return np.concatenate([rotvec, rotvec[..., -1:, :]], axis=-2)
+
+
 TERM_NAMES = ("cube_pos", "cube_quat", "finger_qpos", "contact",
-              "wrist_delta", "qvel")
+              "wrist_delta", "qvel", "cube_angvel")
 
 
 def compute_horizon_reward(
@@ -85,6 +126,7 @@ def compute_horizon_reward(
     actions: np.ndarray,                        # (N, H, A) — wrist-delta penalty
     weights: RewardWeights,
     contact_target_per_step: np.ndarray | None, # (H, 5, 3) cube-frame, NaN = no target
+    ref_cube_rotvec: np.ndarray | None = None,  # (H, 3) — per-tick ref rotation increment
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Returns (total_per_sample, terms_per_sample).
 
@@ -99,28 +141,7 @@ def compute_horizon_reward(
     tip_xpos = obs["tip_xpos"]
     qvel = obs.get("qvel")   # (N, H, nv) if env produced it, else None
 
-    # Use wrist-frame distance whenever either deadband or wall is active
-    # so the bubble + wall move with the hand.
-    use_wrist_frame = (weights.cube_pos_deadband_m > 0.0
-                       or weights.cube_pos_wall_scale > 0.0)
-    if use_wrist_frame:
-        delta_world = cube_pos - ref_cube_pos                          # (N, H, 3)
-        inv_wrist_q = ref_wrist_quat * np.array([1.0, -1.0, -1.0, -1.0])
-        delta_wrist = _quat_rotate_vec(inv_wrist_q[None, :, :], delta_world)
-        pos_dist = np.linalg.norm(delta_wrist, axis=-1)                # (N, H)
-    else:
-        pos_dist = np.linalg.norm(cube_pos - ref_cube_pos, axis=-1)    # (N, H)
-
-    # Linear part: zero inside deadband, linear in excess outside.
-    pos_err = np.maximum(0.0, pos_dist - weights.cube_pos_deadband_m)
-    # Quadratic "hard wall" past deadband + wall_start. Drowns out small
-    # gradient gains the optimizer might claim by letting the cube drift
-    # past a recoverable distance — once it's too far, no MPC plan can
-    # recover the grip geometrically.
-    if weights.cube_pos_wall_scale > 0.0:
-        wall_thresh = weights.cube_pos_deadband_m + weights.cube_pos_wall_start_m
-        hard_excess = np.maximum(0.0, pos_dist - wall_thresh)
-        pos_err = pos_err + weights.cube_pos_wall_scale * hard_excess ** 2
+    pos_err = np.linalg.norm(cube_pos - ref_cube_pos, axis=-1)        # (N, H)
 
     dot = np.abs(np.sum(cube_quat * ref_cube_quat, axis=-1))
     dot = np.clip(dot, -1.0, 1.0)
@@ -160,6 +181,17 @@ def compute_horizon_reward(
     else:
         qvel_err = np.zeros_like(pos_err)
 
+    # Cube angular-velocity tracking: match the per-tick rotation increment
+    # of the reference. Decouples absolute orientation (which may drift) from
+    # the rotation *motion*. Computed by quaternion finite-difference on both
+    # sim and ref (same world frame), so the error is well-posed.
+    if weights.cube_angvel > 0.0 and ref_cube_rotvec is not None:
+        sim_rotvec = rotvec_from_quat_seq(cube_quat)                  # (N, H, 3)
+        angvel_err = np.linalg.norm(
+            sim_rotvec - ref_cube_rotvec[None, :, :], axis=-1)        # (N, H)
+    else:
+        angvel_err = np.zeros_like(pos_err)
+
     terms_per_step = {
         "cube_pos":    -weights.cube_pos    * pos_err,
         "cube_quat":   -weights.cube_quat   * quat_err,
@@ -167,6 +199,7 @@ def compute_horizon_reward(
         "contact":     -weights.contact     * contact_term,
         "wrist_delta": -weights.wrist_delta * wrist_pen,
         "qvel":        -weights.qvel        * qvel_err,
+        "cube_angvel": -weights.cube_angvel * angvel_err,
     }
     # Terminal step gets a larger weight — fix for myopic drift. MPC then
     # considers where the cube ends up at horizon-end, not just per-step.

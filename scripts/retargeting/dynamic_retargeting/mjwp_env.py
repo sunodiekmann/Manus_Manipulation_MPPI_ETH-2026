@@ -22,6 +22,7 @@ from scripts.retargeting.build_ik_scene import compile_dyn
 from scripts.retargeting.dynamic_retargeting.cpu_env import (
     CUBE_GEOM,
     CUBE_FREEJOINT,
+    DEFAULT_SIM_DT,
     N_ACTION,
     N_CUBE_QPOS,
     N_FINGER_CTRL,
@@ -31,8 +32,10 @@ from scripts.retargeting.dynamic_retargeting.cpu_env import (
     SLICE_WRIST,
     TIP_GEOMS,
     WRIST_MOCAP,
+    apply_spider_physics,
     axis_angle_to_quat_wxyz,
     quat_mul_wxyz,
+    slerp_wxyz,
 )
 
 
@@ -65,15 +68,18 @@ def _batched_axis_angle_to_quat(aa: np.ndarray) -> np.ndarray:
 class MjwpEnv:
     """Same surface as cpu_env.CpuEnv (set_world_state, step_world,
     snapshot_world_into_batch, rollout_with_resample, warmup_grasp,
-    set_closure_bias, get_world_cube_*), but stepping N worlds in parallel
-    on GPU via mujoco_warp.
+    get_world_cube_*), but stepping N worlds in parallel on GPU via
+    mujoco_warp.
     """
 
-    def __init__(self, num_samples: int, sim_dt: float = 0.002):
+    def __init__(self, num_samples: int, sim_dt: float = DEFAULT_SIM_DT,
+                 spider_physics: bool = True):
         self.mj_model, _ = compile_dyn(sim_dt=sim_dt)
         self.mj_model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
         self.mj_model.opt.iterations = 20
         self.mj_model.opt.ls_iterations = 50
+        if spider_physics:
+            apply_spider_physics(self.mj_model)
         if self.mj_model.nu != N_FINGER_CTRL:
             raise ValueError(f"Model nu={self.mj_model.nu}, expected "
                              f"{N_FINGER_CTRL}")
@@ -128,22 +134,7 @@ class MjwpEnv:
         self._world_mocap_quat[:, 0] = 1.0
         self._world_ctrl = np.zeros(self.nu, dtype=np.float64)
 
-        self.ctrl_bias = np.zeros(N_FINGER_CTRL, dtype=np.float64)
-
     # ── ergonomic API mirror of CpuEnv ────────────────────────────────────
-
-    def set_closure_bias(self, bias_rad: float) -> None:
-        self.ctrl_bias = bias_rad * self._flexion_closure_direction()
-
-    def _flexion_closure_direction(self) -> np.ndarray:
-        d = np.zeros(N_FINGER_CTRL, dtype=np.float64)
-        for i in range(N_FINGER_CTRL):
-            lo, hi = self.mj_model.jnt_range[i + 1]
-            if lo >= 0.0 and hi > 0.0:
-                d[i] = 1.0
-            elif hi <= 0.0 and lo < 0.0:
-                d[i] = -1.0
-        return d
 
     def set_world_state(self, hand_qpos: np.ndarray, cube_pose7: np.ndarray,
                         qvel: np.ndarray | None = None) -> None:
@@ -171,7 +162,7 @@ class MjwpEnv:
 
     def warmup_grasp(self, cube_pose7: np.ndarray, finger_ctrl: np.ndarray,
                      ref_wrist_pos: np.ndarray, ref_wrist_quat: np.ndarray,
-                     n_steps: int, closure_bias: float = 0.0) -> None:
+                     n_steps: int) -> None:
         """Kinematic-pin warmup: step physics for n_steps with the cube
         qpos overwritten + qvel zeroed after every substep so fingers
         settle around a stationary cube. Pulls qpos/qvel back to host once
@@ -179,8 +170,6 @@ class MjwpEnv:
         if n_steps <= 0:
             return
         ctrl = np.asarray(finger_ctrl, dtype=np.float64).copy()
-        if closure_bias > 0.0:
-            ctrl += closure_bias * self._flexion_closure_direction()
         ctrl = np.clip(ctrl, self.finger_act_lo, self.finger_act_hi)
         self._world_ctrl[:N_FINGER_CTRL] = ctrl
         self._world_mocap_pos[self.wrist_mocap_idx] = ref_wrist_pos
@@ -210,24 +199,46 @@ class MjwpEnv:
     # ── world stepping ───────────────────────────────────────────────────
 
     def step_world(self, action: np.ndarray, ref_wrist_pos: np.ndarray,
-                   ref_wrist_quat: np.ndarray, n_substeps: int) -> None:
-        """Apply the chosen plan[0] to the outer world. Pulls the resulting
-        qpos back to host for the next MPC tick's reference."""
-        finger_ctrl = np.clip(action[SLICE_FINGER] + self.ctrl_bias,
-                              self.finger_act_lo, self.finger_act_hi)
-        delta = action[SLICE_WRIST]
-        wrist_quat = quat_mul_wxyz(ref_wrist_quat, axis_angle_to_quat_wxyz(delta))
-        self._world_ctrl[:N_FINGER_CTRL] = finger_ctrl
-        self._world_mocap_pos[self.wrist_mocap_idx] = ref_wrist_pos
-        self._world_mocap_quat[self.wrist_mocap_idx] = wrist_quat
-
-        self.dw_world.ctrl.assign(self._world_ctrl[None].astype(np.float32))
-        self.dw_world.mocap_pos.assign(self._world_mocap_pos[None].astype(np.float32))
-        self.dw_world.mocap_quat.assign(self._world_mocap_quat[None].astype(np.float32))
-        for _ in range(n_substeps):
+                   ref_wrist_quat: np.ndarray, n_substeps: int,
+                   next_action: np.ndarray | None = None,
+                   next_ref_wrist_pos: np.ndarray | None = None,
+                   next_ref_wrist_quat: np.ndarray | None = None,
+                   record_stride: int = 0):
+        """Apply the chosen control step to the outer world (interpolating toward
+        next_* across substeps when given — smooth control spline instead of a
+        zero-order-hold staircase). Returns a dense (n_rec, 34) array of
+        [hand_qpos(27), cube_pose7] when record_stride>0, else None. Pulls the
+        resulting qpos back to host for the next MPC tick."""
+        a1 = action if next_action is None else next_action
+        p1 = ref_wrist_pos if next_ref_wrist_pos is None else next_ref_wrist_pos
+        q1 = ref_wrist_quat if next_ref_wrist_quat is None else next_ref_wrist_quat
+        rec = [] if record_stride > 0 else None
+        for s in range(n_substeps):
+            alpha = s / n_substeps
+            a = (1.0 - alpha) * action + alpha * a1
+            rp = (1.0 - alpha) * ref_wrist_pos + alpha * p1
+            rq = slerp_wxyz(ref_wrist_quat, q1, alpha)
+            finger_ctrl = np.clip(a[SLICE_FINGER],
+                                  self.finger_act_lo, self.finger_act_hi)
+            wrist_quat = quat_mul_wxyz(rq, axis_angle_to_quat_wxyz(a[SLICE_WRIST]))
+            self._world_ctrl[:N_FINGER_CTRL] = finger_ctrl
+            self._world_mocap_pos[self.wrist_mocap_idx] = rp
+            self._world_mocap_quat[self.wrist_mocap_idx] = wrist_quat
+            self.dw_world.ctrl.assign(self._world_ctrl[None].astype(np.float32))
+            self.dw_world.mocap_pos.assign(self._world_mocap_pos[None].astype(np.float32))
+            self.dw_world.mocap_quat.assign(self._world_mocap_quat[None].astype(np.float32))
             wp.capture_launch(self._graph_world)
+            if rec is not None and (s % record_stride == 0):
+                self._world_qpos[:] = self.dw_world.qpos.numpy()[0]
+                rec.append(np.concatenate([self._world_qpos[:N_HAND_QPOS],
+                                           self.get_world_cube_pose7()]))
         self._world_qpos[:] = self.dw_world.qpos.numpy()[0]
         self._world_qvel[:] = self.dw_world.qvel.numpy()[0]
+        if rec is not None:
+            rec.append(np.concatenate([self._world_qpos[:N_HAND_QPOS],
+                                       self.get_world_cube_pose7()]))
+            return np.asarray(rec)
+        return None
 
     # ── batched rollout ──────────────────────────────────────────────────
 
@@ -276,7 +287,7 @@ class MjwpEnv:
 
         for h in range(H):
             action_h = actions[:, h]                                # (N, 23)
-            finger = np.clip(action_h[:, SLICE_FINGER] + self.ctrl_bias,
+            finger = np.clip(action_h[:, SLICE_FINGER],
                              self.finger_act_lo, self.finger_act_hi)
             ctrl_buf[:, :N_FINGER_CTRL] = finger
 
