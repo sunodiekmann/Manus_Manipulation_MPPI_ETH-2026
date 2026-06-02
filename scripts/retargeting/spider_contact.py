@@ -88,7 +88,8 @@ def _build_model():
     return model, data, tip_geom_ids, cube_gid, geom_to_finger, wrist_mocap_id
 
 
-def _replay_session(retargeted_qpos: np.ndarray, cube_pose_used: np.ndarray):
+def _replay_session(retargeted_qpos: np.ndarray, cube_pose_used: np.ndarray,
+                    cube_half_m: float = None):
     """Replay the kinematic IK trajectory and compute per-frame contact state.
 
     Returns
@@ -153,7 +154,7 @@ def _replay_session(retargeted_qpos: np.ndarray, cube_pose_used: np.ndarray):
             tip_pos_w = np.asarray(data.geom_xpos[tip_gid[f]])
             p = R_wc.T @ (tip_pos_w - cube_pos_w)
             pos_cube[i, f] = p
-            sd_cube[i, f] = float(np.abs(p).max() - _CUBE_HALF)
+            sd_cube[i, f] = float(np.abs(p).max() - (cube_half_m if cube_half_m is not None else _CUBE_HALF))
         geom_mask[i] = in_contact
 
     return geom_mask, pos_cube, sd_cube
@@ -439,6 +440,7 @@ def _apply_manual_constraints(
     mask: np.ndarray,            # (N, 5) bool — pre-constraint contact mask
     pos_cube: np.ndarray,        # (N, 5, 3) — fingertip cube-frame positions
     target_per_frame: np.ndarray, # (N, 5, 3) — segmented contact target (will be patched)
+    cube_half_m: float = None,
 ):
     """Enforce manual constraints on the detection output:
 
@@ -466,7 +468,9 @@ def _apply_manual_constraints(
                 # being a short phase) we leave it NaN — but the mask stays.
                 tgt = out_target[t, f]
                 if not np.any(np.isnan(tgt)):
-                    out_target[t, f] = project_target_onto_face(tgt, code, _CUBE_HALF)
+                    out_target[t, f] = project_target_onto_face(
+                        tgt, code,
+                        cube_half_m if cube_half_m is not None else _CUBE_HALF)
     return out_mask, out_target
 
 
@@ -475,6 +479,9 @@ def detect_contact_session(
     force: bool = False,
     print_stats: bool = False,
     sd_mask_threshold_m: float = SD_MASK_THRESHOLD,
+    cube_edge_m: float | None = None,
+    stage2_tag: str | None = None,
+    output_tag: str | None = None,
 ) -> None:
     """Run contact detection on Stage 2 (SPIDER equality-IK) output.
 
@@ -482,16 +489,20 @@ def detect_contact_session(
     loose pushes (tip 5-10 mm above the cube) still register as intended
     contact.
     """
-    retarget_path = session_dir / "retargeted_sequence.npz"
+    rt_name = (f"retargeted_sequence__{stage2_tag}.npz" if stage2_tag
+               else "retargeted_sequence.npz")
+    out_name = (f"contact_sequence__{output_tag}.npz" if output_tag
+                else "contact_sequence.npz")
+    retarget_path = session_dir / rt_name
     if not retarget_path.exists():
         raise FileNotFoundError(
             f"{retarget_path.name} not found in {session_dir}. "
             "Run scripts.retargeting.retarget_sequence_spider first."
         )
 
-    output_path = session_dir / "contact_sequence.npz"
+    output_path = session_dir / out_name
     if output_path.exists() and not force:
-        print("  [skip] contact_sequence.npz already exists (--force to overwrite)")
+        print(f"  [skip] {out_name} already exists (--force to overwrite)")
         return
 
     print(f"  source: SPIDER IK  ({retarget_path.name})")
@@ -500,7 +511,19 @@ def detect_contact_session(
     retargeted_qpos = np.asarray(data["retargeted_qpos"], dtype=float)
     cube_pose_used = np.asarray(data["cube_pose_used"], dtype=float)
 
-    geom_mask, pos_cube, sd_cube = _replay_session(retargeted_qpos, cube_pose_used)
+    # Use the cube edge stamped into the Stage 2 npz if present; CLI override
+    # wins if explicitly set. Both must agree on the cube the contact targets
+    # were detected against.
+    stamped_edge = (float(data["cube_edge_m"])
+                    if "cube_edge_m" in data.files else None)
+    eff_edge = cube_edge_m if cube_edge_m is not None else stamped_edge
+    cube_half_local = (float(eff_edge) / 2.0) if eff_edge is not None else None
+    if cube_half_local is not None:
+        print(f"  cube edge: {eff_edge*1000:.0f} mm "
+              f"(half = {cube_half_local*1000:.0f} mm)")
+
+    geom_mask, pos_cube, sd_cube = _replay_session(
+        retargeted_qpos, cube_pose_used, cube_half_m=cube_half_local)
     # SD-based fallback contact: tip within `sd_mask_threshold_m` of the cube
     # surface counts as contact even without a detected collision.
     sd_mask = (sd_cube <= sd_mask_threshold_m) & ~np.isnan(sd_cube)
@@ -526,6 +549,7 @@ def detect_contact_session(
         from scripts.retargeting.manual_contacts import FORBIDDEN, UNCONSTRAINED
         smoothed, target_per_frame = _apply_manual_constraints(
             constraints, smoothed, pos_cube, target_per_frame,
+            cube_half_m=cube_half_local,
         )
         n_forbidden = int((constraints == FORBIDDEN).sum())
         n_facebound = int((constraints >= 0).sum())
@@ -575,6 +599,17 @@ def main():
                         help="SD threshold (m) below which the tip is considered "
                              "in contact even without a geom collision. Catches "
                              f"loose pushes. Default {SD_MASK_THRESHOLD*1000:.1f} mm.")
+    parser.add_argument("--cube-edge", type=float, default=None, metavar="M",
+                        help="Override cube edge (m) for surface-snap math. "
+                             "If the Stage 2 npz has cube_edge_m stamped, "
+                             "that value is auto-used; CLI here is for the "
+                             "edge case of a Stage 2 file without the stamp.")
+    parser.add_argument("--stage2-tag", type=str, default=None,
+                        help="Read retargeted_sequence__<TAG>.npz instead of "
+                             "the canonical name.")
+    parser.add_argument("--tag", type=str, default=None,
+                        help="Write contact_sequence__<TAG>.npz instead of "
+                             "the canonical name.")
     cli_args, _ = parser.parse_known_args()
     paths = cli_args.session_dirs
 
@@ -593,6 +628,9 @@ def main():
                 force=cli_args.force,
                 print_stats=cli_args.stats,
                 sd_mask_threshold_m=cli_args.sd_threshold,
+                cube_edge_m=cli_args.cube_edge,
+                stage2_tag=cli_args.stage2_tag,
+                output_tag=cli_args.tag,
             )
         except Exception as e:
             print(f"  [error] {e}")

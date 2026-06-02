@@ -45,18 +45,30 @@ CUBE_GEOM = "tracked_cube_geom"
 WRIST_MOCAP = "wrist_mocap"
 CUBE_FREEJOINT = "cube_freejoint"
 
-# Default sim timestep. SPIDER-matched: 0.01 (their setup_mj_model). Was 0.002.
-DEFAULT_SIM_DT = 0.01
+# Default sim timestep. SPIDER uses 0.01; we use 0.005 — stiff `solimp`
+# (1 mm contact width) needs finer integration than SPIDER's soft contacts
+# could tolerate. Was 0.002 pre-rebuild.
+DEFAULT_SIM_DT = 0.005
 
-# SPIDER contact model (spider/simulators/mjwp.py setup_mj_model + generate_xml):
-#   - soft contacts ("softer contact for sim2real"): solimp dmin=0, width=0.03
-#   - condim 4 on the cube (torsional friction active → grip resists cube spin;
-#     ours was 3, which let the cube pivot freely on a fingertip)
-#   - object friction [1, 1, 0.1] (torsional 1.0 active at condim 4)
-# These are the levers SPIDER uses *instead of* domain randomization.
-SPIDER_SOLIMP = [0.0, 0.95, 0.03, 0.5, 2.0]
-SPIDER_FRICTION = [1.0, 1.0, 0.1]
-SPIDER_CUBE_CONDIM = 4
+# SPIDER contact model (spider/simulators/mjwp.py setup_mj_model + generate_xml).
+# We keep SPIDER's condim 4 + friction [1, 1, 0.1] but deliberately **deviate**
+# on solimp: SPIDER uses dmin=0 / width=0.03 ("softer contact for sim2real"),
+# which is too squishy for our in-hand cube rotation — the 60 mm cube can
+# interpenetrate the fingertips by up to half the constraint width, killing
+# effective normal force and grip. We use the XML's stiff values instead
+# ([0.9, 0.99, 0.001] with default midpoint=0.5 / power=2.0).
+SPIDER_SOLIMP = [0.9, 0.99, 0.001, 0.5, 2.0]
+# Friction = [sliding, torsional, rolling]. At condim 3 (our setting) only
+# the sliding component is used — torsional and rolling are no-ops in the
+# solver. Kept the SPIDER-style values mainly for documentation; only
+# sliding=1.0 has any effect.
+SPIDER_FRICTION = [1.0, 0.1, 0.1]
+# condim 3 (not SPIDER's 4): two-finger pinch already locks 5 DOFs from
+# sliding friction + lever arm. The one remaining DOF is rotation about
+# the pinch axis = torsional spin at each contact — which is what we want
+# to *allow*, not resist. SPIDER's condim 4 is right for whole-hand pour/
+# wipe where contacts align with the spin axis; wrong for pinch-pitch.
+SPIDER_CUBE_CONDIM = 3
 
 
 def apply_spider_physics(model) -> None:
@@ -122,21 +134,18 @@ class CpuEnv:
     """Sequential CPU rollout env. Owns 1 world + N batch MjData."""
 
     def __init__(self, num_samples: int, sim_dt: float = DEFAULT_SIM_DT,
-                 spider_physics: bool = True):
-        self.model, _ = compile_dyn(sim_dt=sim_dt)
-        # Match MjwpEnv's solver config so a cpu rollout compares apples-to-
-        # apples with an mjwp-planned one. Findings (2026-05): integrator and
-        # iteration count are no-ops for this model (implicit-fast ≡ Euler with
-        # no passive damping; the solver converges well under 20 iters), but
-        # impratio IS real — mujoco_warp does NOT honor impratio (its Option
-        # has no such field; it behaves as impratio=1), while the XML asks for
-        # 10. Leaving cpu at 10 ran *stiffer friction* than the GPU planner.
-        # Matching to 1 isolates the residual gap to float32-vs-float64 +
-        # warp's separate solver implementation (which is not configurable).
+                 spider_physics: bool = True,
+                 cube_edge_m: float | None = None,
+                 cube_mass_kg: float | None = None):
+        self.model, _ = compile_dyn(sim_dt=sim_dt,
+                                    cube_edge_m=cube_edge_m,
+                                    cube_mass_kg=cube_mass_kg)
+        # Match MjwpEnv's solver config on the axes mjwp actually uses
+        # (implicit-fast ≡ Euler with no passive damping for this model;
+        # solver converges well under 20 iters).
         self.model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
         self.model.opt.iterations = 20
         self.model.opt.ls_iterations = 50
-        self.model.opt.impratio = 1.0
         if spider_physics:
             apply_spider_physics(self.model)
         self.num_samples = num_samples
@@ -233,23 +242,17 @@ class CpuEnv:
                    next_ref_wrist_pos: np.ndarray | None = None,
                    next_ref_wrist_quat: np.ndarray | None = None,
                    record_stride: int = 0):
-        """Advance the world one control step.
+        """Advance the world one control step. Zero-order-hold: `action`
+        and the wrist mocap target are held constant for the full
+        n_substeps, matching what `rollout_with_resample` assumes when
+        scoring plans (so the planner's forecast and execution agree).
 
-        If `next_*` are given, the applied control + reference wrist are linearly
-        interpolated (SLERP for the wrist quat) from this control step toward the
-        next across the n_substeps — a smooth control spline instead of a
-        0.4 s zero-order-hold staircase. Returns a dense (n_rec, 34) array of
-        [hand_qpos(27), cube_pose7] when record_stride>0, else None."""
-        a1 = action if next_action is None else next_action
-        p1 = ref_wrist_pos if next_ref_wrist_pos is None else next_ref_wrist_pos
-        q1 = ref_wrist_quat if next_ref_wrist_quat is None else next_ref_wrist_quat
+        `next_*` parameters are accepted for API compatibility but unused.
+        """
+        del next_action, next_ref_wrist_pos, next_ref_wrist_quat  # ZOH, unused
         rec = [] if record_stride > 0 else None
+        self._apply_action_to_data(self.world, action, ref_wrist_pos, ref_wrist_quat)
         for s in range(n_substeps):
-            alpha = s / n_substeps
-            a = (1.0 - alpha) * action + alpha * a1
-            rp = (1.0 - alpha) * ref_wrist_pos + alpha * p1
-            rq = slerp_wxyz(ref_wrist_quat, q1, alpha)
-            self._apply_action_to_data(self.world, a, rp, rq)
             mujoco.mj_step(self.model, self.world)
             if rec is not None and (s % record_stride == 0):
                 rec.append(self.world.qpos[:N_HAND_QPOS + N_CUBE_QPOS].copy())
@@ -277,6 +280,8 @@ class CpuEnv:
         n_substeps: int,
         ref_cube_pos: np.ndarray,       # (H, 3)
         drop_threshold_m: float | None = None,
+        ref_cube_quat: np.ndarray | None = None,  # (H, 4) wxyz
+        drop_threshold_rad: float | None = None,
     ) -> dict:
         """Roll all N samples through the H-step horizon, stepping
         horizon-by-horizon so we can swap dropped-cube samples with good
@@ -324,12 +329,20 @@ class CpuEnv:
                     if other is not None:
                         obs["tip_in_contact"][i, h, tip_gids.index(other)] = True
 
-            if (drop_threshold_m is not None
+            if ((drop_threshold_m is not None or drop_threshold_rad is not None)
                     and h < H - 1
                     and not terminated.all()):
-                cube_pos_err = np.linalg.norm(
-                    obs["cube_pos"][:, h] - ref_cube_pos[h], axis=-1)
-                dropped = (cube_pos_err > drop_threshold_m) & ~terminated
+                dropped = np.zeros(N, dtype=bool)
+                if drop_threshold_m is not None:
+                    cube_pos_err = np.linalg.norm(
+                        obs["cube_pos"][:, h] - ref_cube_pos[h], axis=-1)
+                    dropped |= cube_pos_err > drop_threshold_m
+                if drop_threshold_rad is not None and ref_cube_quat is not None:
+                    dot = np.abs(np.sum(
+                        obs["cube_quat_wxyz"][:, h] * ref_cube_quat[h], axis=-1))
+                    rot_err = 2.0 * np.arccos(np.clip(dot, -1.0, 1.0))
+                    dropped |= rot_err > drop_threshold_rad
+                dropped &= ~terminated
                 good = ~dropped & ~terminated
                 if dropped.any() and good.any():
                     bad_idx = np.where(dropped)[0]

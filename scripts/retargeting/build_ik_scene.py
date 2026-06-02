@@ -26,7 +26,34 @@ BASE_XML = Path(__file__).resolve().parents[2] / "assets" / "output_mocap_physic
 
 WRIST_MOCAP_BODY = "wrist_mocap"
 CUBE_BODY = "tracked_cube"
+CUBE_GEOM = "tracked_cube_geom"
 CUBE_TARGET_MOCAP_BODY = "cube_target"
+
+
+def apply_cube_geometry(model, edge_m: float | None = None,
+                        mass_kg: float | None = None) -> None:
+    """Mutate `model` in place to override the cube's edge length and/or
+    mass. Recomputes inertia for a uniform solid cube.
+
+    edge_m: full edge length (m). Updates geom_size to [edge/2]·3.
+    mass_kg: cube body mass (kg).
+
+    If both are given, the final state is a uniform solid cube of
+    (edge_m, mass_kg) regardless of XML defaults.
+    """
+    cube_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, CUBE_GEOM)
+    cube_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, CUBE_BODY)
+    # Decide final (edge, mass) — preserving the unspecified axis.
+    cur_half = float(model.geom_size[cube_gid, 0])
+    cur_edge = 2.0 * cur_half
+    final_edge = float(edge_m) if edge_m is not None else cur_edge
+    final_mass = float(mass_kg) if mass_kg is not None else float(model.body_mass[cube_bid])
+    half = final_edge / 2.0
+    model.geom_size[cube_gid] = [half, half, half]
+    model.body_mass[cube_bid] = final_mass
+    # Uniform solid cube: I = (1/6) m a² on each principal axis.
+    I = (1.0 / 6.0) * final_mass * (final_edge ** 2)
+    model.body_inertia[cube_bid] = [I, I, I]
 
 
 @dataclass(frozen=True)
@@ -176,7 +203,10 @@ def build_ik_spec(*, base_xml: Path | str = BASE_XML) -> mujoco.MjSpec:
 
 
 def compile_ik(*, base_xml: Path | str = BASE_XML, sim_dt: float = 0.01,
-               disable_collisions: bool = True, dump_to: Path | str | None = None):
+               disable_collisions: bool = True,
+               cube_edge_m: float | None = None,
+               cube_mass_kg: float | None = None,
+               dump_to: Path | str | None = None):
     """Compile the IK spec and apply the solver/disable flags SPIDER uses."""
     spec = build_ik_spec(base_xml=base_xml)
     if dump_to is not None:
@@ -200,10 +230,14 @@ def compile_ik(*, base_xml: Path | str = BASE_XML, sim_dt: float = 0.01,
             continue
         model.body_mass[bid] *= 1e-3
         model.body_inertia[bid] *= 1e-3
+    if cube_edge_m is not None or cube_mass_kg is not None:
+        apply_cube_geometry(model, cube_edge_m, cube_mass_kg)
     return model, mujoco.MjData(model)
 
 
 def compile_dyn(*, base_xml: Path | str = BASE_XML, sim_dt: float = 0.01,
+                cube_edge_m: float | None = None,
+                cube_mass_kg: float | None = None,
                 dump_to: Path | str | None = None):
     """Compile the base scene as-is for Stage 3 MPC.
 
@@ -217,6 +251,8 @@ def compile_dyn(*, base_xml: Path | str = BASE_XML, sim_dt: float = 0.01,
         Path(dump_to).write_text(spec.to_xml())
     model = spec.compile()
     model.opt.timestep = sim_dt
+    if cube_edge_m is not None or cube_mass_kg is not None:
+        apply_cube_geometry(model, cube_edge_m, cube_mass_kg)
     return model, mujoco.MjData(model)
 
 

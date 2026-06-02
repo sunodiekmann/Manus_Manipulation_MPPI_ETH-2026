@@ -262,6 +262,7 @@ def _run_session(session_dir: Path, *, show_viewer=False, force=False,
                  fingertip_offsets=None,
                  pin_wrist=False, loop=False,
                  cube_shift=None,
+                 cube_edge_m=None,
                  output_name="retargeted_sequence.npz"):
     # --loop is interactive observation only; never overwrite the canonical file.
     write_output = not loop
@@ -292,8 +293,11 @@ def _run_session(session_dir: Path, *, show_viewer=False, force=False,
 
     wrist_offset = np.asarray(wrist_offset, dtype=float)
 
-    model, data = compile_ik(sim_dt=SIM_DT)
+    model, data = compile_ik(sim_dt=SIM_DT, cube_edge_m=cube_edge_m)
     mocap_idx, site_ids = _make_index(model)
+    if cube_edge_m is not None:
+        print(f"  cube edge override: {cube_edge_m*1000:.0f} mm "
+              f"(default XML cube was used during processing).")
 
     retargeted_qpos = np.full((N, 27), np.nan)
     cube_pose_used = np.full((N, 7), np.nan)
@@ -377,6 +381,8 @@ def _run_session(session_dir: Path, *, show_viewer=False, force=False,
         )
         if cube_shift is not None:
             save_kwargs["cube_shift"] = np.asarray(cube_shift, dtype=float)
+        if cube_edge_m is not None:
+            save_kwargs["cube_edge_m"] = float(cube_edge_m)
         np.savez_compressed(output_path, **save_kwargs)
         print(f"  Saved: {output_path}")
     else:
@@ -405,6 +411,15 @@ def main(argv=None):
                              "shift flag needed). Use to give the cube room "
                              "from the palm when the recording places it "
                              "uncomfortably close (cube_pitch case).")
+    parser.add_argument("--cube-edge", type=float, default=None, metavar="M",
+                        help="Override cube edge length (m). The IK scene's "
+                             "cube geom is resized to [edge/2]·3 and inertia "
+                             "recomputed; downstream cube-frame contact "
+                             "targets are re-derived against the new surface.")
+    parser.add_argument("--tag", type=str, default=None,
+                        help="Output to retargeted_sequence__<tag>.npz "
+                             "(use for per-edge reruns to avoid clobbering "
+                             "the canonical Stage 2 output).")
     parser.add_argument("--no-offsets", action="store_true",
                         help="Zero both DEFAULT_WRIST_OFFSET and "
                              "OFFLINE_TARGET_OFFSETS for this run, so the IK "
@@ -431,13 +446,17 @@ def main(argv=None):
         wrist_offset = DEFAULT_WRIST_OFFSET
         fingertip_offsets = OFFLINE_TARGET_OFFSETS
 
+    output_name = (f"retargeted_sequence__{args.tag}.npz" if args.tag
+                   else "retargeted_sequence.npz")
     for session_dir in args.session_dirs:
         print(f"[{session_dir}]")
         _run_session(session_dir, show_viewer=args.viewer, force=args.force,
                      loop=args.loop, pin_wrist=args.pin_wrist,
                      cube_shift=cube_shift,
+                     cube_edge_m=args.cube_edge,
                      wrist_offset=wrist_offset,
-                     fingertip_offsets=fingertip_offsets)
+                     fingertip_offsets=fingertip_offsets,
+                     output_name=output_name)
 
 
 if __name__ == "__main__":

@@ -45,13 +45,13 @@ class MPPIConfig:
     horizon_steps: int = 4           # H control steps (SPIDER horizon/ctrl_dt = 1.6/0.4)
     num_samples: int = 1024          # N (SPIDER example 1024; Config default 2048)
     num_knots: int = 4               # control knots; == H here → no interpolation
-    max_iters: int = 16              # per-step refinement iters (SPIDER, early-stoppable)
-    n_substeps: int = 40             # mj_step per control step (ctrl_dt/sim_dt = 0.4/0.01)
-    sim_dt: float = 0.01             # SPIDER setup_mj_model timestep
+    max_iters: int = 8              # per-step refinement iters (SPIDER, early-stoppable)
+    n_substeps: int = 40             # mj_step per control step (ctrl_dt/sim_dt = 0.2/0.005)
+    sim_dt: float = 0.005            # finer than SPIDER's 0.01 — stiff solimp needs it
 
     # Cross-entropy weighting. Lower temp = sharper weighting on top samples.
     top_frac: float = 0.1            # weight only the top-10% samples
-    softmax_temp: float = 0.1        # SPIDER temperature
+    softmax_temp: float = 0.3        # temperature (higher = softer commit to top samples)
 
     # Per-iter global noise annealing. SPIDER computes beta from final_noise_scale
     # so that scale**max_iters == final_noise_scale (set in optimize_step).
@@ -64,14 +64,34 @@ class MPPIConfig:
     last_step_noise_scale: float = 1.0    # SPIDER last_ctrl_noise_scale
 
     # Per-component noise std (in ctrl units). SPIDER joint 0.15, pos/rot 0.03.
-    finger_noise_std: float = 0.15   # rad per joint per knot
+    finger_noise_std: float = 0.1   # rad per joint per knot
     wrist_noise_std: float = 0.03    # rad axis-angle
+
+    # Exploit samples: SPIDER reserves the LAST `exploit_ratio` fraction of
+    # samples with noise scaled by `exploit_noise_scale` (≈ near-greedy
+    # samples close to the prior plan). Acts as insurance — if exploration
+    # finds nothing better, the weighted average reverts cleanly to the
+    # prior because many near-zero-noise samples reinforce it.
+    exploit_ratio: float = 0.01      # fraction of N reserved for exploit
+    exploit_noise_scale: float = 0.01  # noise multiplier on exploit samples
 
     # Action clipping
     wrist_delta_clip: float = 0.05   # rad axis-angle
 
-    # Resample-on-drop threshold (None disables the swap inside rollout).
+    # Resample-on-drop thresholds (None disables the swap inside rollout).
     drop_threshold_m: float | None = 0.10
+    drop_threshold_rad: float | None = field(
+        default_factory=lambda: float(np.radians(30.0)))  # 30° default
+
+    # Diagnostic: also rollout the chosen plan after each MPPI iter (not just
+    # at the end). Reveals averaging-collapse (where best-sample rew_max
+    # improves but plan_rew stays flat). Doubles per-tick rollout count.
+    eval_plan_each_iter: bool = False
+
+    # SPIDER-style early stopping: break the iter loop when the best sample
+    # beats the prior plan (sample 0) by less than this threshold.
+    # MPPI has converged — more iters won't help.
+    improvement_threshold: float = 0.01
 
     weights: RewardWeights = field(default_factory=RewardWeights)
 
@@ -140,6 +160,11 @@ def _sample_actions(
         * global_noise_scale
     )
     delta[0] = 0.0  # zero-noise prior evaluation
+    # SPIDER exploit samples: last K samples get noise scaled toward zero
+    # so the weighted average has insurance against bad iterations.
+    num_exploit = max(0, int(cfg.num_samples * cfg.exploit_ratio))
+    if num_exploit > 0:
+        delta[-num_exploit:] *= cfg.exploit_noise_scale
 
     samples = plan[None, :, :] + delta
 
@@ -201,6 +226,8 @@ def optimize_step(
     info = {
         "rew_max": [], "rew_mean": [], "frac_terminated": [],
         "terms": {k: [] for k in TERM_NAMES},
+        "plan_rew": [],  # per-iter only if eval_plan_each_iter; else single final value
+        "plan_terms": {k: [] for k in TERM_NAMES},
     }
     # SPIDER global-noise anneal: beta s.t. beta**max_iters == final_noise_scale.
     if cfg.final_noise_scale > 0.0 and cfg.max_iters > 0:
@@ -219,6 +246,8 @@ def optimize_step(
             n_substeps=cfg.n_substeps,
             ref_cube_pos=ref_cube_pos,
             drop_threshold_m=cfg.drop_threshold_m,
+            ref_cube_quat=ref_cube_quat,
+            drop_threshold_rad=cfg.drop_threshold_rad,
         )
         rews, term_per_sample = compute_horizon_reward(
             obs=obs,
@@ -243,4 +272,65 @@ def optimize_step(
         info["frac_terminated"].append(float(obs["terminated"].mean()))
         for k, v in term_per_sample.items():
             info["terms"][k].append(float(v.mean()))
+
+        # Per-iter plan eval (optional, diagnostic). Doubles rollout count.
+        if cfg.eval_plan_each_iter and it < cfg.max_iters - 1:
+            _eval_plan_into_info(
+                env, plan, ref_wrist_pos, ref_wrist_quat, ref_qpos,
+                ref_cube_pos, ref_cube_quat, ref_finger_qvel,
+                contact_target_per_step, ref_cube_rotvec, cfg, info)
+
+        # SPIDER-style early stopping: if exploration found nothing notably
+        # better than the prior plan, MPPI has converged — stop iterating.
+        improvement = float(rews.max() - rews[0])
+        if improvement < cfg.improvement_threshold:
+            break
+
+    # Final-iter plan eval (always on, ~12.5% overhead at iters=8).
+    # Logs the reward of the actually-applied plan, not the best-sample
+    # forecast — exposes "averaging collapse" if plan_rew < rew_max.
+    _eval_plan_into_info(
+        env, plan, ref_wrist_pos, ref_wrist_quat, ref_qpos,
+        ref_cube_pos, ref_cube_quat, ref_finger_qvel,
+        contact_target_per_step, ref_cube_rotvec, cfg, info)
     return plan, info
+
+
+def _eval_plan_into_info(
+    env, plan, ref_wrist_pos, ref_wrist_quat, ref_qpos,
+    ref_cube_pos, ref_cube_quat, ref_finger_qvel,
+    contact_target_per_step, ref_cube_rotvec, cfg, info,
+):
+    """Rollout the chosen plan and append its reward + per-term values
+    to info['plan_rew'] / info['plan_terms']. Broadcasts plan to N samples
+    (the env batch size); uses sample 0's result. Resample-on-drop is
+    disabled here — we want the raw plan's reward, not a repaired version."""
+    H = plan.shape[0]
+    plan_samples = np.broadcast_to(
+        plan[None], (cfg.num_samples, H, N_ACTION)).copy()
+    env.snapshot_world_into_batch()
+    plan_obs = env.rollout_with_resample(
+        actions=plan_samples,
+        ref_wrist_pos=ref_wrist_pos,
+        ref_wrist_quat=ref_wrist_quat,
+        n_substeps=cfg.n_substeps,
+        ref_cube_pos=ref_cube_pos,
+        drop_threshold_m=None,
+        ref_cube_quat=ref_cube_quat,
+        drop_threshold_rad=None,
+    )
+    plan_rews, plan_term_per_sample = compute_horizon_reward(
+        obs=plan_obs,
+        ref_qpos=ref_qpos,
+        ref_cube_pos=ref_cube_pos,
+        ref_cube_quat=ref_cube_quat,
+        ref_wrist_quat=ref_wrist_quat,
+        ref_finger_qvel=ref_finger_qvel,
+        actions=plan_samples,
+        weights=cfg.weights,
+        contact_target_per_step=contact_target_per_step,
+        ref_cube_rotvec=ref_cube_rotvec,
+    )
+    info["plan_rew"].append(float(plan_rews[0]))
+    for k, v in plan_term_per_sample.items():
+        info["plan_terms"][k].append(float(v[0]))

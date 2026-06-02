@@ -36,15 +36,18 @@ class RewardWeights:
     # Defaults are the validated working config (cube_roll2 + cube_pitch2,
     # 2026-05-21): orientation-led tracking with a strong contact term and a
     # light finger_qpos pull. A bare Stage-3 run reproduces these results.
-    cube_pos: float = 0.5          # per metre
-    cube_quat: float = 0.7         # per rad
-    finger_qpos: float = 0.2       # per rad — soft pull to IK ref; the IK
-                                   # pose is "touch", not "grasp", so a
-                                   # heavy weight here actively fights
-                                   # force-closure discovery
-    contact: float = 1.8           # per metre, summed over fingers
+    cube_pos: float = 1.0          # per metre
+    cube_quat: float = 0.6         # per rad
+    finger_qpos: float = 0.05      # per rad — weak guide toward IK ref.
+                                   # Matched ~SPIDER's hierarchy: object
+                                   # tracking ≫ finger pose so the planner
+                                   # can deviate from infeasible IK frames
+                                   # (e.g. regrips). SPIDER joint_rew_scale
+                                   # 0.003 in a bundled-norm formulation;
+                                   # ours is a separate L2 term, hence ~10×.
+    contact: float = 2.0           # per metre, summed over fingers
     wrist_delta: float = 0.3       # per rad
-    qvel: float = 0.005            # per rad/s on finger qvel DEVIATION
+    qvel: float = 0.01            # per rad/s on finger qvel DEVIATION
                                    # from reference. Penalizing absolute
                                    # qvel (or wrist/cube qvel) blocks
                                    # in-hand rotation; restrict to finger
@@ -54,7 +57,7 @@ class RewardWeights:
                                    # Default 0 (pure pose tracking). Raise
                                    # it (and optionally drop cube_quat) for
                                    # motion/task-style tracking.
-    terminal_scale: float = 3.0
+    terminal_scale: float = 10.0
     """Multiplier on the LAST horizon-step reward. Helps with myopic
     drift by making MPC care about where the cube ends up at horizon-end,
     not just per-step average. Kept modest — too high and the optimizer
@@ -201,12 +204,23 @@ def compute_horizon_reward(
         "qvel":        -weights.qvel        * qvel_err,
         "cube_angvel": -weights.cube_angvel * angvel_err,
     }
-    # Terminal step gets a larger weight — fix for myopic drift. MPC then
-    # considers where the cube ends up at horizon-end, not just per-step.
-    if weights.terminal_scale != 1.0:
-        scale = float(weights.terminal_scale)
-        for k in terms_per_step:
-            terms_per_step[k] = terms_per_step[k].copy()
+    # Terminal step (h=H-1) handling:
+    #   - Tracking terms (cube_pos, cube_quat, finger_qpos) become QUADRATIC
+    #     in the error magnitude, matching SPIDER's get_terminal_reward
+    #     (mjwp_eq.py: sum(delta_qpos**2)). Quadratic gives a sharper basin
+    #     at the endpoint than linear: forgiving near zero, steep at large
+    #     errors. Then multiplied by terminal_scale.
+    #   - Non-tracking terms (contact, wrist_delta, qvel, cube_angvel) keep
+    #     their linear penalty * terminal_scale, since they're behavioral
+    #     constraints we want enforced uniformly across the horizon.
+    scale = float(weights.terminal_scale)
+    for k in terms_per_step:
+        terms_per_step[k] = terms_per_step[k].copy()
+    terms_per_step["cube_pos"][:, -1]    = -weights.cube_pos    * pos_err[:, -1] ** 2 * scale
+    terms_per_step["cube_quat"][:, -1]   = -weights.cube_quat   * quat_err[:, -1] ** 2 * scale
+    terms_per_step["finger_qpos"][:, -1] = -weights.finger_qpos * finger_err[:, -1] ** 2 * scale
+    if scale != 1.0:
+        for k in ("contact", "wrist_delta", "qvel", "cube_angvel"):
             terms_per_step[k][:, -1] *= scale
     terms = {k: v.sum(axis=-1) for k, v in terms_per_step.items()}
     total = sum(terms.values())

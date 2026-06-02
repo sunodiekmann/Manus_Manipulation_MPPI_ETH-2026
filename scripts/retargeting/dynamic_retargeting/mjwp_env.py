@@ -73,8 +73,12 @@ class MjwpEnv:
     """
 
     def __init__(self, num_samples: int, sim_dt: float = DEFAULT_SIM_DT,
-                 spider_physics: bool = True):
-        self.mj_model, _ = compile_dyn(sim_dt=sim_dt)
+                 spider_physics: bool = True,
+                 cube_edge_m: float | None = None,
+                 cube_mass_kg: float | None = None):
+        self.mj_model, _ = compile_dyn(sim_dt=sim_dt,
+                                       cube_edge_m=cube_edge_m,
+                                       cube_mass_kg=cube_mass_kg)
         self.mj_model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
         self.mj_model.opt.iterations = 20
         self.mj_model.opt.ls_iterations = 50
@@ -204,29 +208,26 @@ class MjwpEnv:
                    next_ref_wrist_pos: np.ndarray | None = None,
                    next_ref_wrist_quat: np.ndarray | None = None,
                    record_stride: int = 0):
-        """Apply the chosen control step to the outer world (interpolating toward
-        next_* across substeps when given — smooth control spline instead of a
-        zero-order-hold staircase). Returns a dense (n_rec, 34) array of
-        [hand_qpos(27), cube_pose7] when record_stride>0, else None. Pulls the
-        resulting qpos back to host for the next MPC tick."""
-        a1 = action if next_action is None else next_action
-        p1 = ref_wrist_pos if next_ref_wrist_pos is None else next_ref_wrist_pos
-        q1 = ref_wrist_quat if next_ref_wrist_quat is None else next_ref_wrist_quat
+        """Apply the chosen control step to the outer world. Zero-order-hold:
+        `action` and the wrist mocap target are held constant for the full
+        n_substeps, matching what `rollout_with_resample` assumes when scoring
+        plans (so the planner's forecast and the execution agree).
+
+        `next_*` parameters are accepted for API compatibility but unused.
+        """
+        del next_action, next_ref_wrist_pos, next_ref_wrist_quat  # ZOH, unused
         rec = [] if record_stride > 0 else None
+        finger_ctrl = np.clip(action[SLICE_FINGER],
+                              self.finger_act_lo, self.finger_act_hi)
+        wrist_quat = quat_mul_wxyz(ref_wrist_quat,
+                                   axis_angle_to_quat_wxyz(action[SLICE_WRIST]))
+        self._world_ctrl[:N_FINGER_CTRL] = finger_ctrl
+        self._world_mocap_pos[self.wrist_mocap_idx] = ref_wrist_pos
+        self._world_mocap_quat[self.wrist_mocap_idx] = wrist_quat
+        self.dw_world.ctrl.assign(self._world_ctrl[None].astype(np.float32))
+        self.dw_world.mocap_pos.assign(self._world_mocap_pos[None].astype(np.float32))
+        self.dw_world.mocap_quat.assign(self._world_mocap_quat[None].astype(np.float32))
         for s in range(n_substeps):
-            alpha = s / n_substeps
-            a = (1.0 - alpha) * action + alpha * a1
-            rp = (1.0 - alpha) * ref_wrist_pos + alpha * p1
-            rq = slerp_wxyz(ref_wrist_quat, q1, alpha)
-            finger_ctrl = np.clip(a[SLICE_FINGER],
-                                  self.finger_act_lo, self.finger_act_hi)
-            wrist_quat = quat_mul_wxyz(rq, axis_angle_to_quat_wxyz(a[SLICE_WRIST]))
-            self._world_ctrl[:N_FINGER_CTRL] = finger_ctrl
-            self._world_mocap_pos[self.wrist_mocap_idx] = rp
-            self._world_mocap_quat[self.wrist_mocap_idx] = wrist_quat
-            self.dw_world.ctrl.assign(self._world_ctrl[None].astype(np.float32))
-            self.dw_world.mocap_pos.assign(self._world_mocap_pos[None].astype(np.float32))
-            self.dw_world.mocap_quat.assign(self._world_mocap_quat[None].astype(np.float32))
             wp.capture_launch(self._graph_world)
             if rec is not None and (s % record_stride == 0):
                 self._world_qpos[:] = self.dw_world.qpos.numpy()[0]
@@ -263,6 +264,8 @@ class MjwpEnv:
         n_substeps: int,
         ref_cube_pos: np.ndarray,       # (H, 3)
         drop_threshold_m: float | None = None,
+        ref_cube_quat: np.ndarray | None = None,  # (H, 4) wxyz
+        drop_threshold_rad: float | None = None,
     ) -> dict:
         N = self.num_samples
         H = actions.shape[1]
@@ -316,11 +319,19 @@ class MjwpEnv:
             for f, gid in enumerate(self.tip_gids):
                 obs["tip_xpos"][:, h, f] = geom_xpos[:, gid]
 
-            if (drop_threshold_m is not None
+            if ((drop_threshold_m is not None or drop_threshold_rad is not None)
                     and h < H - 1
                     and not terminated.all()):
-                err = np.linalg.norm(cube_pos - ref_cube_pos[h], axis=-1)
-                dropped = (err > drop_threshold_m) & ~terminated
+                dropped = np.zeros(N, dtype=bool)
+                if drop_threshold_m is not None:
+                    err = np.linalg.norm(cube_pos - ref_cube_pos[h], axis=-1)
+                    dropped |= err > drop_threshold_m
+                if drop_threshold_rad is not None and ref_cube_quat is not None:
+                    sim_quat = qpos_N[:, cube_qadr + 3 : cube_qadr + 7]
+                    dot = np.abs(np.sum(sim_quat * ref_cube_quat[h], axis=-1))
+                    rot_err = 2.0 * np.arccos(np.clip(dot, -1.0, 1.0))
+                    dropped |= rot_err > drop_threshold_rad
+                dropped &= ~terminated
                 good = ~dropped & ~terminated
                 if dropped.any() and good.any():
                     bad_idx = np.where(dropped)[0]

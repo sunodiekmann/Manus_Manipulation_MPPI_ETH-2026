@@ -2,11 +2,10 @@
 
 Two modes:
 
-  Default (Stage 3 dynamic): plays back the qpos + cube trajectory produced by
-  `scripts.retargeting.optimize_sequence_dynamic` against the same physics
-  scene the MPPI ran in (`assets/output_mocap_physics.xml`). Orange ghost
-  cube shows the MPC reference (cube_ref_used if present in the dynamic
-  npz, otherwise Stage 2's cube_pose_used).
+  Default (Stage 3 dynamic): plays back the per-tick qpos + cube trajectory
+  produced by `scripts.retargeting.optimize_sequence_dynamic`. The orange
+  ghost is the MPC reference (cube_ref_used) at the SAME tick — so visual
+  error matches the saved pos_err_history / rot_err_history exactly.
 
   --stage2: plays the Stage 2 kinematic IK output directly from
   `retargeted_sequence.npz` (hand qpos + cube pose). With --cube-shift X Y Z
@@ -69,15 +68,7 @@ def _draw_ghost_cube(scene, cube_pose, rgba, half_size=0.035):
 
 
 def _load_stage2(session_dir: Path, cube_shift: np.ndarray | None):
-    """Returns (qpos, cube_play, cube_shifted_or_none, timeline).
-
-    cube_play is the *real* cube body's pose during playback (the Stage 2
-    cube — already shifted if Stage 2 was run with --cube-shift).
-    cube_shifted is an *additional* preview overlay: it asks "what would
-    Stage 2 place the cube at if I added THIS shift on top?", drawn as a
-    green ghost so you can eyeball direction/magnitude before re-running
-    Stage 2 with that shift baked in. None if no preview shift given.
-    """
+    """Returns (qpos, cube_play, cube_shifted_or_none, timeline)."""
     ref_path = session_dir / "retargeted_sequence.npz"
     if not ref_path.exists():
         raise FileNotFoundError(f"missing {ref_path}")
@@ -97,65 +88,34 @@ def _load_stage2(session_dir: Path, cube_shift: np.ndarray | None):
     return qpos, cube_play, cube_shifted, timeline
 
 
-def _load_stage3(session_dir: Path, tag: str | None = None, dense: bool = True):
-    """Returns (qpos, cube_sim, cube_ref_or_none, timeline). Prefers
-    `cube_ref_used` from the dynamic npz (matches dynamic's frame count
-    even with --time-scale); falls back to Stage 2's cube_pose_used.
-
-    `tag` selects retargeted_sequence_dynamic__<tag>.npz (a tagged sweep
-    run); None loads the canonical retargeted_sequence_dynamic.npz.
-    `dense` uses the per-substep dense trajectory (smooth playback) if the
-    npz has one; otherwise falls back to the per-control-step trajectory."""
+def _load_stage3(session_dir: Path, tag: str | None = None):
+    """Returns (qpos, cube_sim, cube_ref_or_none, timeline) — all per-tick."""
     dyn_name = (f"retargeted_sequence_dynamic__{tag}.npz" if tag
                 else "retargeted_sequence_dynamic.npz")
     dyn_path = session_dir / dyn_name
     if not dyn_path.exists():
         raise FileNotFoundError(f"missing {dyn_path}")
     dyn = np.load(dyn_path)
-    coarse_timeline = np.asarray(dyn["timeline"], dtype=float)
-    if dense and "dense_qpos" in dyn.files:
-        qpos = np.asarray(dyn["dense_qpos"], dtype=float)
-        cube_sim = np.asarray(dyn["dense_cube"], dtype=float)
-        timeline = np.asarray(dyn["dense_timeline"], dtype=float)
-        print(f"  dense playback: {qpos.shape[0]} frames "
-              f"({1.0/np.diff(timeline).mean():.0f} fps)")
-    else:
-        qpos = np.asarray(dyn["retargeted_qpos"], dtype=float)
-        cube_sim = np.asarray(dyn["cube_traj"], dtype=float)
-        timeline = coarse_timeline
-    if "cube_ref_used" in dyn.files:
-        cube_ref = np.asarray(dyn["cube_ref_used"], dtype=float)
-        # Map the coarse ghost onto the (possibly dense) playback timeline by
-        # nearest control-step in time, so the ghost stays aligned.
-        if cube_ref.shape[0] != qpos.shape[0]:
-            idx = np.clip(np.searchsorted(coarse_timeline, timeline) - 1,
-                          0, cube_ref.shape[0] - 1)
-            cube_ref = cube_ref[idx]
-    else:
-        ref_path = session_dir / "retargeted_sequence.npz"
-        cube_ref = (
-            np.asarray(np.load(ref_path)["cube_pose_used"], dtype=float)
-            if ref_path.exists() else None
-        )
-        # Length mismatch (e.g. dynamic was run with --time-scale): drop
-        # the ghost to avoid an index error.
-        if cube_ref is not None and cube_ref.shape[0] != qpos.shape[0]:
-            print(f"  [warn] Stage 2 ref has {cube_ref.shape[0]} frames vs "
-                  f"dynamic's {qpos.shape[0]}; ghost disabled. Re-run "
-                  f"optimize_sequence_dynamic to save cube_ref_used.")
-            cube_ref = None
+    qpos = np.asarray(dyn["retargeted_qpos"], dtype=float)
+    cube_sim = np.asarray(dyn["cube_traj"], dtype=float)
+    timeline = np.asarray(dyn["timeline"], dtype=float)
+    cube_ref = (np.asarray(dyn["cube_ref_used"], dtype=float)
+                if "cube_ref_used" in dyn.files else None)
+    if cube_ref is not None and cube_ref.shape[0] != qpos.shape[0]:
+        print(f"  [warn] cube_ref_used has {cube_ref.shape[0]} frames vs "
+              f"qpos {qpos.shape[0]}; ghost disabled.")
+        cube_ref = None
     return qpos, cube_sim, cube_ref, timeline
 
 
 def replay(session_dir: Path, *, speed: float, show_ref: bool, loop: bool,
-           stage2: bool, cube_shift: np.ndarray | None, tag: str | None = None,
-           dense: bool = True):
+           stage2: bool, cube_shift: np.ndarray | None, tag: str | None = None):
     if stage2:
         qpos, cube_play, cube_shifted, timeline = _load_stage2(session_dir, cube_shift)
-        cube_ref_ghost = None  # in stage2 mode, "ref" overlay would equal cube_play
+        cube_ref_ghost = None
         mode_label = f"stage2  shift={cube_shift if cube_shift is not None else 'none'}"
     else:
-        qpos, cube_play, cube_ref_ghost, timeline = _load_stage3(session_dir, tag, dense)
+        qpos, cube_play, cube_ref_ghost, timeline = _load_stage3(session_dir, tag)
         if not show_ref:
             cube_ref_ghost = None
         cube_shifted = None
@@ -219,9 +179,6 @@ def main():
                    help="replay a tagged sweep run "
                         "(retargeted_sequence_dynamic__<tag>.npz). "
                         "Ignored with --stage2.")
-    p.add_argument("--no-dense", dest="dense", action="store_false",
-                   help="play the per-control-step trajectory instead of the "
-                        "dense per-substep one (coarse/jumpy; for debugging).")
     p.add_argument("--cube-shift", type=float, nargs=3, default=None,
                    metavar=("X", "Y", "Z"),
                    help="wrist-frame shift (m) to preview as a green ghost "
@@ -235,8 +192,7 @@ def main():
         print("  [note] --cube-shift ignored without --stage2")
         shift = None
     replay(args.session_dir, speed=args.speed, show_ref=args.show_ref,
-           loop=args.loop, stage2=args.stage2, cube_shift=shift, tag=args.tag,
-           dense=args.dense)
+           loop=args.loop, stage2=args.stage2, cube_shift=shift, tag=args.tag)
 
 
 if __name__ == "__main__":
