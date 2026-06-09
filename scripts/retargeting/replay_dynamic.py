@@ -105,17 +105,30 @@ def _load_stage3(session_dir: Path, tag: str | None = None):
         print(f"  [warn] cube_ref_used has {cube_ref.shape[0]} frames vs "
               f"qpos {qpos.shape[0]}; ghost disabled.")
         cube_ref = None
-    return qpos, cube_sim, cube_ref, timeline
+    # Pull cube_edge_m / cube_mass_kg from run_config so the visual cube
+    # matches what was actually simulated.
+    cfg = {}
+    if "run_config" in dyn.files:
+        import json
+        try:
+            cfg = json.loads(str(dyn["run_config"]))
+        except Exception:
+            cfg = {}
+    cube_edge_m = cfg.get("cube_edge_m")
+    cube_mass_kg = cfg.get("cube_mass_kg")
+    return qpos, cube_sim, cube_ref, timeline, cube_edge_m, cube_mass_kg
 
 
 def replay(session_dir: Path, *, speed: float, show_ref: bool, loop: bool,
            stage2: bool, cube_shift: np.ndarray | None, tag: str | None = None):
+    cube_edge_m = cube_mass_kg = None
     if stage2:
         qpos, cube_play, cube_shifted, timeline = _load_stage2(session_dir, cube_shift)
         cube_ref_ghost = None
         mode_label = f"stage2  shift={cube_shift if cube_shift is not None else 'none'}"
     else:
-        qpos, cube_play, cube_ref_ghost, timeline = _load_stage3(session_dir, tag)
+        qpos, cube_play, cube_ref_ghost, timeline, cube_edge_m, cube_mass_kg = \
+            _load_stage3(session_dir, tag)
         if not show_ref:
             cube_ref_ghost = None
         cube_shifted = None
@@ -123,6 +136,15 @@ def replay(session_dir: Path, *, speed: float, show_ref: bool, loop: bool,
 
     N = qpos.shape[0]
     model = mujoco.MjModel.from_xml_path(str(PHYSICS_XML))
+    if cube_edge_m is not None or cube_mass_kg is not None:
+        # Mutate the rendered cube to match the run config — otherwise the
+        # cube on screen is always XML default (70 mm, 40 g) regardless of
+        # what was actually simulated.
+        from scripts.retargeting.build_ik_scene import apply_cube_geometry
+        apply_cube_geometry(model, edge_m=cube_edge_m, mass_kg=cube_mass_kg)
+        print(f"  cube override: "
+              f"edge={cube_edge_m if cube_edge_m is not None else 'XML'} m  "
+              f"mass={cube_mass_kg if cube_mass_kg is not None else 'XML'} kg")
     data = mujoco.MjData(model)
 
     dt_per_frame = float(np.diff(timeline).mean()) if N > 1 else 0.05
@@ -150,9 +172,11 @@ def replay(session_dir: Path, *, speed: float, show_ref: bool, loop: bool,
                 with viewer.lock():
                     viewer.user_scn.ngeom = 0
                     if cube_ref_ghost is not None:
-                        _draw_ghost_cube(viewer.user_scn, cube_ref_ghost[t], GHOST_REF_RGBA)
+                        _draw_ghost_cube(viewer.user_scn, cube_ref_ghost[t], GHOST_REF_RGBA,
+                                         half_size=(cube_edge_m or 0.07) / 2.0)
                     if cube_shifted is not None:
-                        _draw_ghost_cube(viewer.user_scn, cube_shifted[t], GHOST_SHIFTED_RGBA)
+                        _draw_ghost_cube(viewer.user_scn, cube_shifted[t], GHOST_SHIFTED_RGBA,
+                                         half_size=(cube_edge_m or 0.07) / 2.0)
 
                 mujoco.mj_camlight(model, data)
                 viewer.sync()

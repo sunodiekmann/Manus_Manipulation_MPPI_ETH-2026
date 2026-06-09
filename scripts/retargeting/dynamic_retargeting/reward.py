@@ -211,8 +211,7 @@ def compute_horizon_reward(
     #     at the endpoint than linear: forgiving near zero, steep at large
     #     errors. Then multiplied by terminal_scale.
     #   - Non-tracking terms (contact, wrist_delta, qvel, cube_angvel) keep
-    #     their linear penalty * terminal_scale, since they're behavioral
-    #     constraints we want enforced uniformly across the horizon.
+    #     their linear penalty × terminal_scale.
     scale = float(weights.terminal_scale)
     for k in terms_per_step:
         terms_per_step[k] = terms_per_step[k].copy()

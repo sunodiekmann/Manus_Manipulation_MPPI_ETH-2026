@@ -74,7 +74,7 @@ def _load_run(path: Path) -> dict | None:
     return {"path": path, "npz": d, "cfg": cfg}
 
 
-def _metrics(run: dict, drop_threshold_m: float) -> dict:
+def _metrics(run: dict, drop_threshold_m: float, ref_n: int | None = None) -> dict:
     d = run["npz"]
     cfg = run["cfg"]
     pos = np.asarray(d["pos_err_history"], dtype=float)        # m
@@ -82,6 +82,13 @@ def _metrics(run: dict, drop_threshold_m: float) -> dict:
     cube_sim = np.asarray(d["cube_traj"], dtype=float)         # (N,7)
     cube_ref = (np.asarray(d["cube_ref_used"], dtype=float)
                 if "cube_ref_used" in d.files else None)
+    # Early-stop detection: optimize_sequence_dynamic.run_session breaks the
+    # loop and saves partial traj when frac_term=1.0, so a successful pos_max
+    # is meaningless if the run didn't complete. ref_n is the expected number
+    # of ticks (length of the un-truncated reference); pass None to skip the
+    # check and only use pos_max.
+    n_actual = pos.shape[0]
+    early_stopped = (ref_n is not None) and (n_actual < ref_n)
 
     cum_sim = _cumulative_rotation_deg(cube_sim[:, 3:7])
     if cube_ref is not None:
@@ -107,8 +114,9 @@ def _metrics(run: dict, drop_threshold_m: float) -> dict:
     improv = float(np.asarray(d["iter_improvement_history"], dtype=float).mean())
 
     return {
-        "n": pos.shape[0],
-        "success": bool(pos.max() <= drop_threshold_m),
+        "n": n_actual,
+        "early_stopped": early_stopped,
+        "success": bool(pos.max() <= drop_threshold_m and not early_stopped),
         "rot_cover": rot_cover,
         "rot_mean": float(rot.mean()), "rot_max": float(rot.max()),
         "rot_fin": float(rot[-1]),
@@ -168,7 +176,19 @@ def main():
     runs = [r for r in (_load_run(pp) for pp in paths) if r is not None]
     if not runs:
         return
-    rows = [(_label(r), _metrics(r, args.drop_threshold), r["cfg"]) for r in runs]
+
+    # Expected reference length (so early-stopped runs are flagged as failures
+    # even though their pos_max stays small after the loop breaks). Take the
+    # longest cube_ref_used across the loaded runs as a proxy for the full
+    # reference, since the Stage 2 npz isn't always in scope here.
+    ref_n_candidates = [
+        int(np.asarray(r["npz"]["cube_ref_used"]).shape[0])
+        for r in runs if "cube_ref_used" in r["npz"].files
+    ]
+    ref_n = max(ref_n_candidates) if ref_n_candidates else None
+
+    rows = [(_label(r), _metrics(r, args.drop_threshold, ref_n=ref_n), r["cfg"])
+            for r in runs]
 
     cols = [
         ("run", "{:<14}", "{:<14}"),
@@ -202,7 +222,14 @@ def main():
             if name == "run":
                 cells.append(vfmt.format(label[:14]))
             elif name == "ok":
-                cells.append(vfmt.format("Y" if m["success"] else "N"))
+                # Y = ran full ref length AND no drop; E = early-stopped on
+                # full drop; N = pos_max exceeded threshold but ran full length
+                if m["success"]:
+                    cells.append(vfmt.format("Y"))
+                elif m["early_stopped"]:
+                    cells.append(vfmt.format("E"))
+                else:
+                    cells.append(vfmt.format("N"))
             elif name == "n":
                 cells.append(vfmt.format(m["n"]))
             else:

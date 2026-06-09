@@ -1,0 +1,48 @@
+  weights: cube_pos=1.0  cube_quat=0.6  finger_qpos=0.05  contact=2.0  wrist_delta=0.3  qvel=0.01  cube_angvel=0.25
+
+cube_roll2
+  Stage 2 plan: retargeted_sequence.npz
+  ctrl_dt=0.050s (= 10·0.005); reference resampled 240 frames @ 50ms → 240 ctrl steps @ 50ms
+  sequence: 240 ref ticks  (12.0s)
+  MPPI: N=2048, H=16, iters=12, substeps=10
+  noise std: finger=0.1  wrist=0.03
+  backend: mjwp  spider_physics: True
+Warp 1.13.0 initialized:
+   CUDA Toolkit 12.9, Driver 12.6
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4080 SUPER" (16 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/suno/.cache/warp/1.13.0
+Module mujoco_warp._src.smooth 976a5d7 load on device 'cuda:0' took 4.19 ms  (cached)
+Module mujoco_warp._src.collision_driver fbb0ee0 load on device 'cuda:0' took 0.20 ms  (cached)
+Module _nxn_broadphase__locals__kernel_d86cb85d d86cb85 load on device 'cuda:0' took 0.21 ms  (cached)
+Module ccd_kernel_builder__locals__ccd_kernel_f6d62883 f6d6288 load on device 'cuda:0' took 0.30 ms  (cached)
+Module _primitive_narrowphase__locals__primitive_narrowphase_458ad554 458ad55 load on device 'cuda:0' took 0.27 ms  (cached)
+Module mujoco_warp._src.constraint eb0e24d load on device 'cuda:0' took 0.31 ms  (cached)
+Module _efc_contact_init__locals__kernel_732198c4 732198c load on device 'cuda:0' took 0.33 ms  (cached)
+Module _efc_contact_jac_dense__locals__kernel_1ef8a44f dca6f30 load on device 'cuda:0' took 0.22 ms  (cached)
+Module _efc_contact_update__locals__kernel_b43fbfe7 b43fbfe load on device 'cuda:0' took 0.19 ms  (cached)
+Module mujoco_warp._src.forward a76b6a3 load on device 'cuda:0' took 0.28 ms  (cached)
+Module mujoco_warp._src.passive 616927b load on device 'cuda:0' took 0.22 ms  (cached)
+Module mujoco_warp._src.forward 398750d load on device 'cuda:0' took 0.26 ms  (cached)
+Module mujoco_warp._src.support f32a4f8 load on device 'cuda:0' took 0.16 ms  (cached)
+Module _tile_cholesky_factorize_solve__locals__cholesky_factorize_solve_c6062390 0f245a2 load on device 'cuda:0' took 52.39 ms  (cached)
+Module _tile_cholesky_factorize_solve__locals__cholesky_factorize_solve_bf4a7e62 13a0179 load on device 'cuda:0' took 53.64 ms  (cached)
+Module mujoco_warp._src.solver 7df28c9 load on device 'cuda:0' took 0.35 ms  (cached)
+Module solve_init_jaref__locals__kernel_27c881e2 27c881e load on device 'cuda:0' took 0.21 ms  (cached)
+Module mul_m_dense__locals___mul_m_dense_795368e5 795368e load on device 'cuda:0' took 0.20 ms  (cached)
+Module update_constraint_efc__locals__kernel_6bfb2757 6bfb275 load on device 'cuda:0' took 0.22 ms  (cached)
+Module update_constraint_gauss_cost__locals__kernel_9843c252 9843c25 load on device 'cuda:0' took 0.20 ms  (cached)
+Module update_gradient_JTDAJ_dense_tiled__locals__kernel_0d42fc90 2083afd load on device 'cuda:0' took 0.54 ms  (cached)
+Module update_gradient_cholesky__locals__kernel_df786760 f87b77b load on device 'cuda:0' took 57.23 ms  (cached)
+Module linesearch_iterative__locals__kernel_f2ca8108 37bc815 load on device 'cuda:0' took 0.33 ms  (cached)
+Module mujoco_warp._src.sensor bee2d80 load on device 'cuda:0' took 0.43 ms  (cached)
+Module mujoco_warp._src.derivative f06cf21 load on device 'cuda:0' took 0.26 ms  (cached)
+  warmup grasp: 50 substeps with cube pinned
+  t=   0/240  realized: pos=  9.2mm  rot=  4.9°  frac_term=0.00  rate=0.38 t/s  ETA=627s
+           plan: rew=  -2.23  best_sample=  -2.23  (MPPI improv +1.02)
+           plan terms (forecast): cube_pos= -0.20  cube_quat= -0.30  finger_qpos= -0.15  contact= -1.18  wrist_delta= -0.19  qvel= -0.13  cube_angvel= -0.09
+  t=  10/240  realized: pos= 13.1mm  rot=  0.6°  frac_term=0.00  rate=0.83 t/s  ETA=277s
+           plan: rew=  -2.31  best_sample=  -2.33  (MPPI improv -0.00)
+           plan terms (forecast): cube_pos= -0.24  cube_quat= -0.44  finger_qpos= -0.14  contact= -0.87  wrist_delta= -0.08  qvel= -0.25  cube_angvel= -0.30

@@ -1,0 +1,171 @@
+  weights: cube_pos=1.0  cube_quat=0.6  finger_qpos=0.05  contact=2.0  wrist_delta=0.3  qvel=0.01  cube_angvel=0.25
+
+cube_roll2
+  Stage 2 plan: retargeted_sequence.npz
+  ctrl_dt=0.050s (= 10·0.005); reference resampled 240 frames @ 50ms → 240 ctrl steps @ 50ms
+  sequence: 240 ref ticks  (12.0s)
+  MPPI: N=2048, H=16, iters=12, substeps=10
+  noise std: finger=0.1  wrist=0.03
+  backend: mjwp  spider_physics: True
+Warp 1.13.0 initialized:
+   CUDA Toolkit 12.9, Driver 12.6
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4080 SUPER" (16 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/suno/.cache/warp/1.13.0
+Module mujoco_warp._src.smooth 976a5d7 load on device 'cuda:0' took 3.95 ms  (cached)
+Module mujoco_warp._src.collision_driver fbb0ee0 load on device 'cuda:0' took 0.20 ms  (cached)
+Module _nxn_broadphase__locals__kernel_d86cb85d d86cb85 load on device 'cuda:0' took 0.19 ms  (cached)
+Module ccd_kernel_builder__locals__ccd_kernel_f6d62883 f6d6288 load on device 'cuda:0' took 0.57 ms  (cached)
+Module _primitive_narrowphase__locals__primitive_narrowphase_458ad554 458ad55 load on device 'cuda:0' took 0.27 ms  (cached)
+Module mujoco_warp._src.constraint eb0e24d load on device 'cuda:0' took 0.33 ms  (cached)
+Module _efc_contact_init__locals__kernel_732198c4 732198c load on device 'cuda:0' took 0.21 ms  (cached)
+Module _efc_contact_jac_dense__locals__kernel_1ef8a44f dca6f30 load on device 'cuda:0' took 0.21 ms  (cached)
+Module _efc_contact_update__locals__kernel_b43fbfe7 b43fbfe load on device 'cuda:0' took 0.22 ms  (cached)
+Module mujoco_warp._src.forward a76b6a3 load on device 'cuda:0' took 0.26 ms  (cached)
+Module mujoco_warp._src.passive 616927b load on device 'cuda:0' took 0.21 ms  (cached)
+Module mujoco_warp._src.forward 398750d load on device 'cuda:0' took 0.27 ms  (cached)
+Module mujoco_warp._src.support f32a4f8 load on device 'cuda:0' took 0.19 ms  (cached)
+Module _tile_cholesky_factorize_solve__locals__cholesky_factorize_solve_c6062390 0f245a2 load on device 'cuda:0' took 51.09 ms  (cached)
+Module _tile_cholesky_factorize_solve__locals__cholesky_factorize_solve_bf4a7e62 13a0179 load on device 'cuda:0' took 53.73 ms  (cached)
+Module mujoco_warp._src.solver 7df28c9 load on device 'cuda:0' took 0.47 ms  (cached)
+Module solve_init_jaref__locals__kernel_27c881e2 27c881e load on device 'cuda:0' took 0.21 ms  (cached)
+Module mul_m_dense__locals___mul_m_dense_795368e5 795368e load on device 'cuda:0' took 0.20 ms  (cached)
+Module update_constraint_efc__locals__kernel_6bfb2757 6bfb275 load on device 'cuda:0' took 0.19 ms  (cached)
+Module update_constraint_gauss_cost__locals__kernel_9843c252 9843c25 load on device 'cuda:0' took 0.19 ms  (cached)
+Module update_gradient_JTDAJ_dense_tiled__locals__kernel_0d42fc90 2083afd load on device 'cuda:0' took 0.42 ms  (cached)
+Module update_gradient_cholesky__locals__kernel_df786760 f87b77b load on device 'cuda:0' took 56.96 ms  (cached)
+Module linesearch_iterative__locals__kernel_f2ca8108 37bc815 load on device 'cuda:0' took 0.35 ms  (cached)
+Module mujoco_warp._src.sensor bee2d80 load on device 'cuda:0' took 0.44 ms  (cached)
+Module mujoco_warp._src.derivative f06cf21 load on device 'cuda:0' took 0.26 ms  (cached)
+  warmup grasp: 50 substeps with cube pinned
+  t=   0/240  realized: pos=  9.1mm  rot=  4.8°  frac_term=0.00  rate=0.38 t/s  ETA=621s
+           plan: rew=  -2.24  best_sample=  -2.24  (MPPI improv +1.01)
+           plan terms (forecast): cube_pos= -0.20  cube_quat= -0.29  finger_qpos= -0.16  contact= -1.16  wrist_delta= -0.21  qvel= -0.13  cube_angvel= -0.09
+  t=  10/240  realized: pos= 13.1mm  rot=  1.1°  frac_term=0.00  rate=0.91 t/s  ETA=251s
+           plan: rew=  -2.19  best_sample=  -2.19  (MPPI improv +0.31)
+           plan terms (forecast): cube_pos= -0.24  cube_quat= -0.49  finger_qpos= -0.15  contact= -0.84  wrist_delta= -0.11  qvel= -0.22  cube_angvel= -0.14
+  t=  20/240  realized: pos= 11.7mm  rot=  0.8°  frac_term=0.00  rate=0.68 t/s  ETA=323s
+           plan: rew=  -3.68  best_sample=  -3.69  (MPPI improv +0.02)
+           plan terms (forecast): cube_pos= -0.30  cube_quat= -0.38  finger_qpos= -0.29  contact= -1.70  wrist_delta= -0.15  qvel= -0.45  cube_angvel= -0.42
+  t=  30/240  realized: pos= 21.1mm  rot=  3.0°  frac_term=0.00  rate=0.57 t/s  ETA=369s
+           plan: rew=  -4.78  best_sample=  -4.81  (MPPI improv +0.00)
+           plan terms (forecast): cube_pos= -0.48  cube_quat= -0.82  finger_qpos= -0.45  contact= -2.33  wrist_delta= -0.08  qvel= -0.37  cube_angvel= -0.24
+  t=  40/240  realized: pos= 26.7mm  rot=  1.5°  frac_term=0.00  rate=0.39 t/s  ETA=507s
+           plan: rew=  -4.40  best_sample=  -4.40  (MPPI improv +1.27)
+           plan terms (forecast): cube_pos= -0.41  cube_quat= -0.37  finger_qpos= -0.60  contact= -1.92  wrist_delta= -0.28  qvel= -0.54  cube_angvel= -0.29
+  t=  50/240  realized: pos= 21.5mm  rot=  2.3°  frac_term=0.00  rate=0.26 t/s  ETA=734s
+           plan: rew=  -4.18  best_sample=  -4.18  (MPPI improv +0.47)
+           plan terms (forecast): cube_pos= -0.43  cube_quat= -0.25  finger_qpos= -0.52  contact= -1.89  wrist_delta= -0.15  qvel= -0.77  cube_angvel= -0.17
+  t=  60/240  realized: pos= 20.4mm  rot=  1.5°  frac_term=0.00  rate=0.24 t/s  ETA=738s
+           plan: rew=  -4.23  best_sample=  -4.24  (MPPI improv +0.33)
+           plan terms (forecast): cube_pos= -0.34  cube_quat= -0.60  finger_qpos= -0.46  contact= -1.57  wrist_delta= -0.20  qvel= -0.78  cube_angvel= -0.28
+  t=  70/240  realized: pos= 13.2mm  rot=  1.8°  frac_term=0.00  rate=0.23 t/s  ETA=737s
+           plan: rew=  -4.44  best_sample=  -4.40  (MPPI improv +0.06)
+           plan terms (forecast): cube_pos= -0.14  cube_quat= -0.68  finger_qpos= -0.41  contact= -1.85  wrist_delta= -0.22  qvel= -0.71  cube_angvel= -0.43
+  t=  80/240  realized: pos=  6.3mm  rot=  5.5°  frac_term=0.00  rate=0.22 t/s  ETA=727s
+           plan: rew=  -3.84  best_sample=  -3.85  (MPPI improv +0.78)
+           plan terms (forecast): cube_pos= -0.17  cube_quat= -0.41  finger_qpos= -0.37  contact= -2.14  wrist_delta= -0.15  qvel= -0.48  cube_angvel= -0.13
+  t=  90/240  realized: pos=  6.8mm  rot=  3.6°  frac_term=0.00  rate=0.22 t/s  ETA=667s
+           plan: rew= -10.88  best_sample=  -6.98  (MPPI improv +4.21)
+           plan terms (forecast): cube_pos= -0.41  cube_quat= -4.93  finger_qpos= -0.48  contact= -3.02  wrist_delta= -0.27  qvel= -0.70  cube_angvel= -1.07
+  ✗ cube dropped at t=92/240 (frac_term=1.00). Ending run, saving partial trajectory.
+  Done in 418.1s (0.57 ticks/s).
+  ── error summary ──
+  cube pos err (mm):  mean= 17.3  max= 36.5
+  cube rot err (°):   mean=  2.0  max=  9.3
+  iter improvement:   mean=+0.52  max=+4.21
+  mean per-term reward across ticks (more-negative = bigger penalty):
+    cube_pos      -0.322
+    cube_quat     -1.648
+    finger_qpos   -0.406
+    contact       -1.999
+    wrist_delta   -0.181
+    qvel          -0.557
+    cube_angvel   -0.366
+  Saved: recordings/cube_roll2/retargeted_sequence_dynamic__sweepN_N2048_s0.npz
+  weights: cube_pos=1.0  cube_quat=0.6  finger_qpos=0.05  contact=2.0  wrist_delta=0.3  qvel=0.01  cube_angvel=0.25
+
+cube_roll2
+  Stage 2 plan: retargeted_sequence.npz
+  ctrl_dt=0.050s (= 10·0.005); reference resampled 240 frames @ 50ms → 240 ctrl steps @ 50ms
+  sequence: 240 ref ticks  (12.0s)
+  MPPI: N=2048, H=16, iters=12, substeps=10
+  noise std: finger=0.1  wrist=0.03
+  backend: mjwp  spider_physics: True
+Warp 1.13.0 initialized:
+   CUDA Toolkit 12.9, Driver 12.6
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4080 SUPER" (16 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/suno/.cache/warp/1.13.0
+Module mujoco_warp._src.smooth 976a5d7 load on device 'cuda:0' took 3.89 ms  (cached)
+Module mujoco_warp._src.collision_driver fbb0ee0 load on device 'cuda:0' took 0.20 ms  (cached)
+Module _nxn_broadphase__locals__kernel_d86cb85d d86cb85 load on device 'cuda:0' took 0.18 ms  (cached)
+Module ccd_kernel_builder__locals__ccd_kernel_f6d62883 f6d6288 load on device 'cuda:0' took 0.35 ms  (cached)
+Module _primitive_narrowphase__locals__primitive_narrowphase_458ad554 458ad55 load on device 'cuda:0' took 0.26 ms  (cached)
+Module mujoco_warp._src.constraint eb0e24d load on device 'cuda:0' took 0.30 ms  (cached)
+Module _efc_contact_init__locals__kernel_732198c4 732198c load on device 'cuda:0' took 0.19 ms  (cached)
+Module _efc_contact_jac_dense__locals__kernel_1ef8a44f dca6f30 load on device 'cuda:0' took 0.24 ms  (cached)
+Module _efc_contact_update__locals__kernel_b43fbfe7 b43fbfe load on device 'cuda:0' took 0.20 ms  (cached)
+Module mujoco_warp._src.forward a76b6a3 load on device 'cuda:0' took 0.40 ms  (cached)
+Module mujoco_warp._src.passive 616927b load on device 'cuda:0' took 0.26 ms  (cached)
+Module mujoco_warp._src.forward 398750d load on device 'cuda:0' took 0.39 ms  (cached)
+Module mujoco_warp._src.support f32a4f8 load on device 'cuda:0' took 0.18 ms  (cached)
+Module _tile_cholesky_factorize_solve__locals__cholesky_factorize_solve_c6062390 0f245a2 load on device 'cuda:0' took 49.08 ms  (cached)
+Module _tile_cholesky_factorize_solve__locals__cholesky_factorize_solve_bf4a7e62 13a0179 load on device 'cuda:0' took 54.69 ms  (cached)
+Module mujoco_warp._src.solver 7df28c9 load on device 'cuda:0' took 0.37 ms  (cached)
+Module solve_init_jaref__locals__kernel_27c881e2 27c881e load on device 'cuda:0' took 0.20 ms  (cached)
+Module mul_m_dense__locals___mul_m_dense_795368e5 795368e load on device 'cuda:0' took 0.20 ms  (cached)
+Module update_constraint_efc__locals__kernel_6bfb2757 6bfb275 load on device 'cuda:0' took 0.21 ms  (cached)
+Module update_constraint_gauss_cost__locals__kernel_9843c252 9843c25 load on device 'cuda:0' took 0.20 ms  (cached)
+Module update_gradient_JTDAJ_dense_tiled__locals__kernel_0d42fc90 2083afd load on device 'cuda:0' took 0.42 ms  (cached)
+Module update_gradient_cholesky__locals__kernel_df786760 f87b77b load on device 'cuda:0' took 56.92 ms  (cached)
+Module linesearch_iterative__locals__kernel_f2ca8108 37bc815 load on device 'cuda:0' took 0.31 ms  (cached)
+Module mujoco_warp._src.sensor bee2d80 load on device 'cuda:0' took 0.39 ms  (cached)
+Module mujoco_warp._src.derivative f06cf21 load on device 'cuda:0' took 0.24 ms  (cached)
+  warmup grasp: 50 substeps with cube pinned
+  t=   0/240  realized: pos=  8.4mm  rot=  3.4°  frac_term=0.00  rate=0.34 t/s  ETA=711s
+           plan: rew=  -2.09  best_sample=  -2.09  (MPPI improv +1.03)
+           plan terms (forecast): cube_pos= -0.19  cube_quat= -0.18  finger_qpos= -0.19  contact= -1.09  wrist_delta= -0.17  qvel= -0.20  cube_angvel= -0.08
+  t=  10/240  realized: pos= 10.7mm  rot=  2.0°  frac_term=0.00  rate=0.88 t/s  ETA=259s
+           plan: rew=  -2.58  best_sample=  -2.58  (MPPI improv +0.00)
+           plan terms (forecast): cube_pos= -0.25  cube_quat= -0.51  finger_qpos= -0.17  contact= -0.82  wrist_delta= -0.10  qvel= -0.31  cube_angvel= -0.42
+  t=  20/240  realized: pos= 16.6mm  rot=  0.3°  frac_term=0.00  rate=0.66 t/s  ETA=331s
+           plan: rew=  -3.86  best_sample=  -3.89  (MPPI improv +0.05)
+           plan terms (forecast): cube_pos= -0.34  cube_quat= -0.53  finger_qpos= -0.36  contact= -1.63  wrist_delta= -0.13  qvel= -0.49  cube_angvel= -0.38
+  t=  30/240  realized: pos= 21.0mm  rot=  2.3°  frac_term=0.00  rate=0.44 t/s  ETA=478s
+           plan: rew=  -4.22  best_sample=  -4.24  (MPPI improv +0.49)
+           plan terms (forecast): cube_pos= -0.48  cube_quat= -0.34  finger_qpos= -0.48  contact= -2.30  wrist_delta= -0.13  qvel= -0.34  cube_angvel= -0.15
+  t=  40/240  realized: pos= 35.5mm  rot=  1.6°  frac_term=0.00  rate=0.28 t/s  ETA=711s
+           plan: rew=  -6.24  best_sample=  -3.92  (MPPI improv +0.85)
+           plan terms (forecast): cube_pos= -0.50  cube_quat= -1.72  finger_qpos= -0.54  contact= -1.63  wrist_delta= -0.17  qvel= -0.87  cube_angvel= -0.80
+  t=  50/240  realized: pos= 35.9mm  rot=  2.1°  frac_term=0.00  rate=0.26 t/s  ETA=726s
+           plan: rew=  -2.32  best_sample=  -2.33  (MPPI improv +0.69)
+           plan terms (forecast): cube_pos= -0.33  cube_quat= -0.23  finger_qpos= -0.32  contact= -0.55  wrist_delta= -0.13  qvel= -0.64  cube_angvel= -0.13
+  t=  60/240  realized: pos= 21.9mm  rot=  1.1°  frac_term=0.00  rate=0.27 t/s  ETA=666s
+           plan: rew=  -2.51  best_sample=  -2.52  (MPPI improv +0.53)
+           plan terms (forecast): cube_pos= -0.22  cube_quat= -0.26  finger_qpos= -0.23  contact= -0.68  wrist_delta= -0.19  qvel= -0.71  cube_angvel= -0.23
+  t=  70/240  realized: pos= 11.5mm  rot=  0.7°  frac_term=0.00  rate=0.25 t/s  ETA=673s
+           plan: rew=  -4.19  best_sample=  -4.19  (MPPI improv +0.48)
+           plan terms (forecast): cube_pos= -0.18  cube_quat= -0.34  finger_qpos= -0.46  contact= -2.14  wrist_delta= -0.11  qvel= -0.63  cube_angvel= -0.31
+  t=  80/240  realized: pos= 12.4mm  rot=  0.6°  frac_term=0.00  rate=0.25 t/s  ETA=644s
+           plan: rew=  -4.61  best_sample=  -4.61  (MPPI improv +0.13)
+           plan terms (forecast): cube_pos= -0.12  cube_quat= -0.38  finger_qpos= -0.58  contact= -2.63  wrist_delta= -0.18  qvel= -0.48  cube_angvel= -0.24
+  t=  90/240  realized: pos=  8.6mm  rot=  2.8°  frac_term=0.00  rate=0.24 t/s  ETA=611s
+           plan: rew=  -5.68  best_sample=  -5.71  (MPPI improv +0.82)
+           plan terms (forecast): cube_pos= -0.22  cube_quat= -1.07  finger_qpos= -0.68  contact= -2.31  wrist_delta= -0.27  qvel= -0.85  cube_angvel= -0.29
+  t= 100/240  realized: pos= 14.5mm  rot=  5.6°  frac_term=0.00  rate=0.23 t/s  ETA=599s
+           plan: rew=  -3.85  best_sample=  -3.89  (MPPI improv +0.25)
+           plan terms (forecast): cube_pos= -0.30  cube_quat= -0.72  finger_qpos= -0.48  contact= -1.03  wrist_delta= -0.23  qvel= -0.84  cube_angvel= -0.25
+  t= 110/240  realized: pos= 16.9mm  rot=  1.4°  frac_term=0.00  rate=0.22 t/s  ETA=578s
+           plan: rew=  -1.75  best_sample=  -1.73  (MPPI improv +0.66)
+           plan terms (forecast): cube_pos= -0.16  cube_quat= -0.12  finger_qpos= -0.27  contact= -0.56  wrist_delta= -0.08  qvel= -0.50  cube_angvel= -0.07
+  t= 120/240  realized: pos=  5.3mm  rot=  0.8°  frac_term=0.00  rate=0.22 t/s  ETA=530s
+           plan: rew=  -2.43  best_sample=  -2.43  (MPPI improv +0.69)
+           plan terms (forecast): cube_pos= -0.13  cube_quat= -0.26  finger_qpos= -0.36  contact= -0.52  wrist_delta= -0.10  qvel= -0.79  cube_angvel= -0.27
+  t= 130/240  realized: pos=  3.4mm  rot=  0.9°  frac_term=0.00  rate=0.22 t/s  ETA=497s
+           plan: rew=  -4.00  best_sample=  -3.88  (MPPI improv +1.02)
+           plan terms (forecast): cube_pos= -0.22  cube_quat= -0.31  finger_qpos= -0.83  contact= -1.83  wrist_delta= -0.07  qvel= -0.57  cube_angvel= -0.17

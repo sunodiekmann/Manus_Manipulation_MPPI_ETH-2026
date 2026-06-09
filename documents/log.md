@@ -1,3 +1,42 @@
+mkdir -p logs
+(
+# N sweep (hold H=16, iters=12)
+for N in 2048 512 256 128; do
+  for S in 0 1 2 3 4; do
+    .venv/bin/python -u -m scripts.retargeting.optimize_sequence_dynamic \
+      recordings/cube_roll2 --backend mjwp \
+      --num-samples $N --horizon 16 --iters 12 --substeps 10 \
+      --seed $S \
+      --tag $(printf "sweepN_N%04d_s%d" $N $S) --force
+  done
+done
+
+# H sweep (hold N=1024, iters=12)
+for H in 24 20 12 8; do
+  for S in 0 1 2 3 4; do
+    .venv/bin/python -u -m scripts.retargeting.optimize_sequence_dynamic \
+      recordings/cube_roll2 --backend mjwp \
+      --num-samples 1024 --horizon $H --iters 12 --substeps 10 \
+      --seed $S \
+      --tag $(printf "sweepH_H%02d_s%d" $H $S) --force
+  done
+done
+
+# iter sweep (hold N=1024, H=16)
+for I in 16 8 4 2; do
+  for S in 0 1 2 3 4; do
+    .venv/bin/python -u -m scripts.retargeting.optimize_sequence_dynamic \
+      recordings/cube_roll2 --backend mjwp \
+      --num-samples 1024 --horizon 16 --iters $I --substeps 10 \
+      --seed $S \
+      --tag $(printf "sweepI_I%02d_s%d" $I $S) --force
+  done
+done
+) 2>&1 | tee logs/pitch_sweep_$(date +%Y%m%d_%H%M).log
+
+ 
+ 
+ 
   t=   0/240  realized: pos=  9.3mm  rot=  5.3°  frac_term=0.00  rate=0.38 t/s  ETA=633s
            plan: rew=  -1.88  best_sample=  -1.90  (MPPI improv +0.75)
            per-iter rew_max:  -2.65  -2.46  -2.29  -2.15  -2.03  -2.00  -1.91  -1.90
