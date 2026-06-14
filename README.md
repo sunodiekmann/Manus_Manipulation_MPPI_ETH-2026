@@ -4,6 +4,8 @@ End-to-end pipeline for capturing human hand–object interactions with Manus Qu
 
 ---
 
+Retargeted in-hand rotation of a 7 cm cube around its three principal axes, optimised with MPPI in MuJoCo:
+
 | Roll | Pitch | Yaw |
 |:----:|:-----:|:---:|
 | ![Roll](recordings/cube_roll2/Roll_Retargeted.gif) | ![Pitch](recordings/cube_pitch2/Pitch_Retargeted.gif) | ![Yaw](recordings/cube_yaw2/Yaw_Retargeted.gif) |
