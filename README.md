@@ -4,6 +4,21 @@ End-to-end pipeline for capturing human hand–object interactions with Manus Qu
 
 ---
 
+<table>
+  <tr>
+    <td align="center"><b>Roll</b></td>
+    <td align="center"><b>Pitch</b></td>
+    <td align="center"><b>Yaw</b></td>
+  </tr>
+  <tr>
+    <td><video src="recordings/cube_roll2/Roll_Retargeted.webm" controls loop muted width="100%"></video></td>
+    <td><video src="recordings/cube_pitch2/Pitch_Retargeted.webm" controls loop muted width="100%"></video></td>
+    <td><video src="recordings/cube_yaw2/Yaw_Retargeted.webm" controls loop muted width="100%"></video></td>
+  </tr>
+</table>
+
+---
+
 ## Table of contents
 
 1. [System overview](#system-overview)

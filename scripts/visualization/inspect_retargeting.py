@@ -144,6 +144,13 @@ def replay(session_dir: Path, *, speed: float, show_ref: bool, loop: bool,
     cube_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "tracked_cube_geom")
     if cube_gid >= 0:
         model.geom_rgba[cube_gid] = CUBE_GEOM_RGBA
+    for tip_body in ("thumb_tip_target", "index_tip_target", "middle_tip_target",
+                     "ring_tip_target", "little_tip_target"):
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, tip_body)
+        if bid >= 0:
+            for gid in range(model.ngeom):
+                if model.geom_bodyid[gid] == bid:
+                    model.geom_rgba[gid, 3] = 0.0
     data = mujoco.MjData(model)
 
     dt_per_frame = float(np.diff(timeline).mean()) if N > 1 else 0.05
