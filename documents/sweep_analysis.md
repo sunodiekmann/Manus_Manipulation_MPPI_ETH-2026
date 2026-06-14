@@ -19,7 +19,7 @@ _Figures saved to `documents/figures/`._
 | motion | $n_{\text{ok}}/n$ | $\bar{e}_{\text{rot}}$ (°) | $e_{\text{rot}}^{\max}$ (°) | $\bar{e}_{\text{pos}}$ (mm) | $e_{\text{pos}}^{\max}$ (mm) | $C_{\parallel}$ | $C_{\perp}$ | $e_{\text{geo}}^{\text{fin}}$ (°) | $T_{\text{wall}}$ (s) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Cube Pitch Motion | 5/5 | 2.20 ± 0.31 | 8.7 ± 2.0 | 12.8 ± 1.1 | 27.5 ± 2.7 | 1.07 ± 0.02 | 1.78 ± 0.18 | 4.83 ± 3.68 | 444 ± 92 |
-| Cube Roll Motion | 5/5 | 2.20 ± 0.24 | 11.4 ± 3.1 | 16.1 ± 0.9 | 42.5 ± 2.1 | 1.19 ± 0.04 | 3.16 ± 0.09 | 4.48 ± 2.08 | 645 ± 39 |
+| Cube Roll Motion | 5/5 | 2.29 ± 0.16 | 12.0 ± 3.0 | 16.3 ± 0.9 | 43.2 ± 3.2 | 1.21 ± 0.04 | 3.17 ± 0.08 | 4.31 ± 2.10 | 641 ± 35 |
 | Cube Yaw Motion | 5/5 | 3.27 ± 1.17 | 14.7 ± 8.1 | 19.1 ± 3.5 | 40.0 ± 10.5 | 1.63 ± 0.29 | 1.98 ± 0.38 | 4.64 ± 2.61 | 719 ± 99 |
 
 Per-tick `rot_err` and `pos_err` over time (individual seeds in blue, mean ± std in orange):
@@ -39,7 +39,7 @@ Base config: $N=1024$, $H=16$, iters$=12$. Optimal config (from the MPPI Pareto 
 | motion | $n_{\text{ok}}/n$ base→opt | $T_{\text{wall}}$ (s) base→opt | $\bar{e}_{\text{rot}}$ (°) base→opt | $e_{\text{geo}}^{\text{fin}}$ (°) base→opt | $C_{\perp}$ base→opt |
 | --- | --- | --- | --- | --- | --- |
 | Cube Pitch Motion | 5/5 → 5/5 | 444 ± 92 → 303 ± 52 (-32%) | 2.20 ± 0.31 → 2.40 ± 0.14 (+9%) | 4.83 ± 3.68 → 1.81 ± 1.57 (-63%) | 1.78 ± 0.18 → 1.65 ± 0.07 (-7%) |
-| Cube Roll Motion | 5/5 → 5/5 | 645 ± 39 → 469 ± 26 (-27%) | 2.20 ± 0.24 → 2.63 ± 0.08 (+19%) | 4.48 ± 2.08 → 2.30 ± 2.13 (-49%) | 3.16 ± 0.09 → 3.50 ± 0.23 (+11%) |
+| Cube Roll Motion | 5/5 → 5/5 | 641 ± 35 → 469 ± 26 (-27%) | 2.29 ± 0.16 → 2.63 ± 0.08 (+15%) | 4.31 ± 2.10 → 2.30 ± 2.13 (-47%) | 3.17 ± 0.08 → 3.50 ± 0.23 (+10%) |
 | Cube Yaw Motion | 5/5 → 5/5 | 719 ± 99 → 482 ± 26 (-33%) | 3.27 ± 1.17 → 3.59 ± 0.32 (+10%) | 4.64 ± 2.61 → 5.61 ± 0.95 (+21%) | 1.98 ± 0.38 → 2.00 ± 0.11 (+1%) |
 
 Side-by-side bars per motion. Green = improvement, red = regression vs base:
@@ -78,6 +78,18 @@ Side-by-side bars per motion. Green = improvement, red = regression vs base:
 | **I=8** | 5/5 | 2.10 ± 0.23 | 12.2 ± 7.4 | 11.6 ± 1.1 | 22.7 ± 2.4 | 1.05 ± 0.01 | 1.58 ± 0.07 | 2.12 ± 2.50 | 384 ± 64 |
 | **I=16** | 5/5 | 2.45 ± 0.29 | 9.9 ± 2.6 | 12.7 ± 0.7 | 24.9 ± 2.1 | 1.05 ± 0.01 | 1.55 ± 0.08 | 6.98 ± 4.56 | 436 ± 73 |
 | *base* | 5/5 | 2.20 ± 0.31 | 8.7 ± 2.0 | 12.8 ± 1.1 | 27.5 ± 2.7 | 1.07 ± 0.02 | 1.78 ± 0.18 | 4.83 ± 3.68 | 444 ± 92 |
+
+#### Early-stopping usage per iters configuration
+
+Configured max iters vs how many MPPI actually consumed on average per tick. Where actual usage is well below the cap, the SPIDER-style improvement-threshold early stop is firing (rew_max is NaN-padded for unused iterations).
+
+| sweep point | $M_{\max}$ | $\langle M_{\text{used}}\rangle$ | $M_{\text{used}}/M_{\max}$ | $n_{\text{ok}}/n$ | $\bar{e}_{\text{rot}}$ (°) | $e_{\text{geo}}^{\text{fin}}$ (°) | $T_{\text{wall}}$ (s) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **I=2** | 2 | 1.54 ± 0.03 | 77% | 5/5 | 3.18 ± 0.38 | 4.34 ± 2.36 | 217 ± 10 |
+| **I=4** | 4 | 2.25 ± 0.12 | 56% | 5/5 | 2.40 ± 0.34 | 4.14 ± 2.09 | 282 ± 16 |
+| **I=8** | 8 | 3.18 ± 0.45 | 40% | 5/5 | 2.10 ± 0.23 | 2.12 ± 2.50 | 384 ± 64 |
+| **I=16** | 16 | 3.57 ± 0.50 | 22% | 5/5 | 2.45 ± 0.29 | 6.98 ± 4.56 | 436 ± 73 |
+| *base* | 12 | 3.71 ± 0.67 | 31% | 5/5 | 2.20 ± 0.31 | 4.83 ± 3.68 | 444 ± 92 |
 
 Compute vs tracking — one panel per swept axis, base marked ★:
 

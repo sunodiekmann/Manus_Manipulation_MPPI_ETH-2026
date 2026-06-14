@@ -245,6 +245,7 @@ def optimize_step(
             ref_wrist_quat=ref_wrist_quat,
             n_substeps=cfg.n_substeps,
             ref_cube_pos=ref_cube_pos,
+            rng=rng,
             drop_threshold_m=cfg.drop_threshold_m,
             ref_cube_quat=ref_cube_quat,
             drop_threshold_rad=cfg.drop_threshold_rad,
@@ -278,7 +279,7 @@ def optimize_step(
             _eval_plan_into_info(
                 env, plan, ref_wrist_pos, ref_wrist_quat, ref_qpos,
                 ref_cube_pos, ref_cube_quat, ref_finger_qvel,
-                contact_target_per_step, ref_cube_rotvec, cfg, info)
+                contact_target_per_step, ref_cube_rotvec, cfg, info, rng)
 
         # SPIDER-style early stopping: if exploration found nothing notably
         # better than the prior plan, MPPI has converged — stop iterating.
@@ -292,14 +293,14 @@ def optimize_step(
     _eval_plan_into_info(
         env, plan, ref_wrist_pos, ref_wrist_quat, ref_qpos,
         ref_cube_pos, ref_cube_quat, ref_finger_qvel,
-        contact_target_per_step, ref_cube_rotvec, cfg, info)
+        contact_target_per_step, ref_cube_rotvec, cfg, info, rng)
     return plan, info
 
 
 def _eval_plan_into_info(
     env, plan, ref_wrist_pos, ref_wrist_quat, ref_qpos,
     ref_cube_pos, ref_cube_quat, ref_finger_qvel,
-    contact_target_per_step, ref_cube_rotvec, cfg, info,
+    contact_target_per_step, ref_cube_rotvec, cfg, info, rng,
 ):
     """Rollout the chosen plan and append its reward + per-term values
     to info['plan_rew'] / info['plan_terms']. Broadcasts plan to N samples
@@ -315,6 +316,7 @@ def _eval_plan_into_info(
         ref_wrist_quat=ref_wrist_quat,
         n_substeps=cfg.n_substeps,
         ref_cube_pos=ref_cube_pos,
+        rng=rng,
         drop_threshold_m=None,
         ref_cube_quat=ref_cube_quat,
         drop_threshold_rad=None,

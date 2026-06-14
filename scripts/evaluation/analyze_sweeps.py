@@ -142,6 +142,16 @@ def load_run(path: Path) -> dict:
     c_par  = par_sim_total  / par_ref_total  if par_ref_total  > 1e-6 else float("nan")
     c_perp = perp_sim_total / perp_ref_total if perp_ref_total > 1e-6 else float("nan")
 
+    # MPPI iters actually used per tick (rew_max is (n_ticks, max_iters) and
+    # NaN-padded where early stopping fired). Average across ticks → how
+    # many iters MPPI used on average before convergence triggered.
+    iters_used_mean = float("nan")
+    iters_max = cfg.get("iters")
+    if "rew_max" in d.files:
+        rew_max = np.asarray(d["rew_max"], dtype=float)
+        iters_used = np.sum(~np.isnan(rew_max), axis=1)
+        iters_used_mean = float(iters_used.mean())
+
     return {
         "path": path,
         "tag": path.stem.replace("retargeted_sequence_dynamic__", ""),
@@ -158,6 +168,8 @@ def load_run(path: Path) -> dict:
         "c_par":  c_par,
         "c_perp": c_perp,
         "fin_geo": _ang_deg(cube_sim[-1, 3:7], cube_ref[-1, 3:7]),
+        "iters_used_mean": iters_used_mean,
+        "iters_max_cfg":   float(iters_max) if iters_max is not None else float("nan"),
         "wall_s": cfg.get("wall_time_s", float("nan")),
         "ticks_s": cfg.get("ticks_per_s", float("nan")),
     }
@@ -227,6 +239,8 @@ def aggregate(paths: list[Path], ref_n: int | None) -> dict:
         "c_par":  stat("c_par"),
         "c_perp": stat("c_perp"),
         "fin_geo": stat("fin_geo"),
+        "iters_used_mean": stat("iters_used_mean"),
+        "iters_max_cfg":   stat("iters_max_cfg"),
         "wall_s": stat("wall_s"),
         "ticks_s": stat("ticks_s"),
         "runs": runs,         # kept for plotting
@@ -321,21 +335,51 @@ def plot_base_per_tick(per_session: dict[str, dict], out_path: Path):
                             color="C1", label=r"$\pm 1\sigma$", zorder=2)
             ax.plot(t_full, mean, color="C1", lw=2.0, label="mean", zorder=3)
             ax.set_ylabel(ylabel)
-            if row == 0:
-                title = (f"{MOTION_LABEL.get(sess, sess)}  "
-                         f"({agg['n_success']}/{agg['n_runs']} success)")
-                ax.set_title(title)
             if row == len(rows_meta) - 1:
-                ax.set_xlabel("time (s)")
+                label = (f"{MOTION_LABEL.get(sess, sess)}  "
+                         f"({agg['n_success']}/{agg['n_runs']} ok)  —  time (s)")
+                ax.set_xlabel(label)
             if row == 0 and col == 0:
                 ax.legend(loc="upper left", fontsize=8)
 
-    fig.suptitle("Per-tick tracking error on the base configuration "
-                 "(5 seeds per motion)", fontsize=13)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     print(f"  saved {out_path}")
     plt.close(fig)
+
+
+def iters_early_stop_table(groups: dict, base_agg: dict | None) -> str:
+    """Per iters-sweep configuration: configured max iters, actual mean iters
+    used (NaN-padded `rew_max` columns count as 'not used'), and the
+    fraction of the budget that was actually consumed. Lets us see at a
+    glance when SPIDER-style early stopping fires."""
+    def row(label, agg):
+        used = agg["iters_used_mean"]    # (mean, std)
+        cap  = agg["iters_max_cfg"][0]   # configured max
+        frac = used[0] / cap if cap > 0 else float("nan")
+        return [
+            label,
+            f"{int(cap)}",
+            f"{used[0]:.2f} ± {used[1]:.2f}",
+            f"{frac*100:.0f}%",
+            f"{agg['n_success']}/{agg['n_runs']}",
+            fmt_mean_std(agg["rot_mean"]),
+            fmt_mean_std(agg["fin_geo"]),
+            fmt_mean_std(agg["wall_s"], 0),
+        ]
+    rows = [row(f"**{key}**", agg) for key, agg in groups.items()]
+    if base_agg is not None:
+        rows.append(row("*base*", base_agg))
+    return md_table(
+        ["sweep point",
+         r"$M_{\max}$",
+         r"$\langle M_{\text{used}}\rangle$",
+         r"$M_{\text{used}}/M_{\max}$",
+         r"$n_{\text{ok}}/n$",
+         r"$\bar{e}_{\text{rot}}$ (°)",
+         r"$e_{\text{geo}}^{\text{fin}}$ (°)",
+         r"$T_{\text{wall}}$ (s)"],
+        rows)
 
 
 def opt_vs_base_table(per_motion_base: dict[str, dict],
@@ -422,13 +466,9 @@ def plot_opt_vs_base(per_motion_base: dict[str, dict],
         ax.set_xticklabels([MOTION_LABEL.get(m, m).replace(" Motion", "")
                             for m in motions])
         ax.set_ylabel(ylabel)
-        ax.set_title(ylabel)
         ax.grid(True, alpha=0.3, axis="y")
 
     axes[0].legend(loc="upper right", fontsize=9)
-    fig.suptitle("Optimal config (N=512, H=20, iters=8) vs base "
-                 "(N=1024, H=16, iters=12) — mean ± σ over 5 seeds",
-                 fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     print(f"  saved {out_path}")
@@ -472,14 +512,11 @@ def plot_wobble_per_tick(per_session: dict[str, dict], out_path: Path):
                         color="C1", zorder=2)
         ax.plot(t_full, mean, color="C1", lw=2.0, label="sim mean", zorder=3)
 
-        ax.set_title(MOTION_LABEL.get(sess, sess))
-        ax.set_xlabel("time (s)")
+        ax.set_xlabel(MOTION_LABEL.get(sess, sess))
         if col == 0:
             ax.set_ylabel(r"cumulative off-axis rotation $\Sigma\,|v_{\perp}|$ (°)")
             ax.legend(loc="upper left", fontsize=8)
 
-    fig.suptitle("Off-axis wobble — cumulative rotation perpendicular to "
-                 "the captured motion's dominant axis (5 seeds)", fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     print(f"  saved {out_path}")
@@ -506,12 +543,13 @@ def plot_mppi_pareto(n_groups: dict, h_groups: dict, i_groups: dict,
         items = list(groups.items())
         items.append((base_label, base_agg))
         items.sort(key=lambda kv: _numeric_key(kv[0]))
-        xs = [v["wall_s"][0] for _, v in items]
-        ys = [v[metric_key][0] for _, v in items]
+        xs   = [v["wall_s"][0] for _, v in items]
+        xerr = [v["wall_s"][1] for _, v in items]
+        ys   = [v[metric_key][0] for _, v in items]
         yerr = [v[metric_key][1] for _, v in items]
 
-        ax.errorbar(xs, ys, yerr=yerr, color=color, marker=marker, lw=1.5,
-                    capsize=3, markersize=8, zorder=3)
+        ax.errorbar(xs, ys, yerr=yerr, xerr=xerr, color=color, marker=marker,
+                    lw=1.5, capsize=3, markersize=8, zorder=3)
         for (label, _), x, y in zip(items, xs, ys):
             num = re.search(r"\d+", label)
             txt = num.group(0) if num else label
@@ -528,15 +566,11 @@ def plot_mppi_pareto(n_groups: dict, h_groups: dict, i_groups: dict,
     for col, (groups, base_label, title, color, marker) in enumerate(axis_data):
         draw_one(axes[0, col], groups, base_label, color, marker, "rot_mean")
         draw_one(axes[1, col], groups, base_label, color, marker, "fin_geo")
-        axes[0, col].set_title(title)
-        axes[1, col].set_xlabel("wall-clock (s)")
+        axes[1, col].set_xlabel(f"wall-clock (s)  —  {title}")
 
     axes[0, 0].set_ylabel("mean rotation error (°)")
     axes[1, 0].set_ylabel("endpoint geodesic error (°)")
     axes[0, 0].legend(loc="upper right", fontsize=8)
-    fig.suptitle(f"MPPI sweep — {MOTION_LABEL['cube_pitch2']} — "
-                 f"compute vs (mean tracking | endpoint pose) — 5 seeds",
-                 fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     print(f"  saved {out_path}")
@@ -607,14 +641,9 @@ def plot_physics_bubble(edge_groups: dict, mass_groups: dict,
 
     axes[0, 0].set_ylabel("mean rotation error (°)")
     axes[1, 0].set_ylabel("endpoint geodesic error (°)")
-    axes[0, 0].set_title("cube edge length")
-    axes[0, 1].set_title("cube mass")
-    axes[1, 0].set_xlabel("edge (mm)")
-    axes[1, 1].set_xlabel("mass (g)")
+    axes[1, 0].set_xlabel("cube edge length (mm)")
+    axes[1, 1].set_xlabel("cube mass (g)")
 
-    fig.suptitle(f"Physics sweep — {MOTION_LABEL['cube_pitch2']} — "
-                 f"tracking + endpoint pose vs reliability (5 seeds)",
-                 fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     print(f"  saved {out_path}")
@@ -756,6 +785,13 @@ def main():
         if i_groups:
             out(f"### iters sweep — N=1024, H=16 fixed\n")
             out(sweep_table(i_groups, base_pitch_agg, "iters"))
+            out("")
+            out(f"#### Early-stopping usage per iters configuration\n")
+            out("Configured max iters vs how many MPPI actually consumed on "
+                "average per tick. Where actual usage is well below the cap, "
+                "the SPIDER-style improvement-threshold early stop is firing "
+                "(rew_max is NaN-padded for unused iterations).\n")
+            out(iters_early_stop_table(i_groups, base_pitch_agg))
             out("")
         if base_pitch_agg is not None:
             out("Compute vs tracking — one panel per swept axis, base marked ★:\n")

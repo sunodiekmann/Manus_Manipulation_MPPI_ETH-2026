@@ -279,6 +279,7 @@ class CpuEnv:
         ref_wrist_quat: np.ndarray,     # (H, 4)
         n_substeps: int,
         ref_cube_pos: np.ndarray,       # (H, 3)
+        rng: np.random.Generator,
         drop_threshold_m: float | None = None,
         ref_cube_quat: np.ndarray | None = None,  # (H, 4) wxyz
         drop_threshold_rad: float | None = None,
@@ -287,6 +288,10 @@ class CpuEnv:
         horizon-by-horizon so we can swap dropped-cube samples with good
         ones between steps (SPIDER resample-on-drop). Returns observations
         used by the reward function plus per-sample terminate flag.
+
+        `rng` is the caller's seeded generator — used only by resample-on-drop
+        (`rng.choice` below). Threading it through (rather than making a fresh
+        `default_rng()` here) keeps the whole MPC deterministic per seed.
         """
         N = self.num_samples
         H = actions.shape[1]
@@ -299,7 +304,6 @@ class CpuEnv:
             "tip_in_contact": np.zeros((N, H, 5), dtype=bool),
         }
         terminated = np.zeros(N, dtype=bool)
-        rng = np.random.default_rng()
         cube_gid = self.ids.cube_geom_id
         tip_gids = self.ids.tip_geom_ids
         tip_gid_set = set(tip_gids)

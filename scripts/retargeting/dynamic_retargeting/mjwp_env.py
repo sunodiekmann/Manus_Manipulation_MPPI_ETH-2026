@@ -263,6 +263,7 @@ class MjwpEnv:
         ref_wrist_quat: np.ndarray,     # (H, 4) wxyz
         n_substeps: int,
         ref_cube_pos: np.ndarray,       # (H, 3)
+        rng: np.random.Generator,
         drop_threshold_m: float | None = None,
         ref_cube_quat: np.ndarray | None = None,  # (H, 4) wxyz
         drop_threshold_rad: float | None = None,
@@ -278,7 +279,6 @@ class MjwpEnv:
             "tip_in_contact": np.zeros((N, H, 5), dtype=bool),  # unused; for API parity
         }
         terminated = np.zeros(N, dtype=bool)
-        rng = np.random.default_rng()
 
         ctrl_buf = np.zeros((N, self.nu), dtype=np.float32)
         mocap_pos_buf = np.broadcast_to(
