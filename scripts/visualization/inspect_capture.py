@@ -1,5 +1,4 @@
-"""
-Replay a recorded session as a 3D matplotlib animation.
+"""Replay a recorded session as a 3D matplotlib animation.
 
 Two modes
 ---------
@@ -14,9 +13,9 @@ raw  (--raw)
     and comparing the effect of filtering / outlier rejection.
 
 Usage:
-    python -m scripts.apps.replay_sequence recordings/<session>
-    python -m scripts.apps.replay_sequence recordings/<session> --raw
-    python -m scripts.apps.replay_sequence recordings/<session> --speed 2.0
+    python -m scripts.visualization.inspect_capture recordings/<session>
+    python -m scripts.visualization.inspect_capture recordings/<session> --raw
+    python -m scripts.visualization.inspect_capture recordings/<session> --speed 2.0
 """
 import json
 import sys
@@ -219,7 +218,6 @@ def replay_raw(session_dir: Path, speed: float = 1.0):
             break
         t0 = time.perf_counter()
 
-        # Left hand
         l_hand_row  = _latest_before(left_hand_rows,  t)
         l_board_row = _latest_before(left_board_rows, t)
         if l_hand_row and l_board_row:
@@ -234,7 +232,6 @@ def replay_raw(session_dir: Path, speed: float = 1.0):
         else:
             clear_skeleton(ls, ll, lt)
 
-        # Right hand
         r_hand_row  = _latest_before(right_hand_rows,  t)
         r_board_row = _latest_before(right_board_rows, t)
         if r_hand_row and r_board_row:
@@ -249,7 +246,6 @@ def replay_raw(session_dir: Path, speed: float = 1.0):
         else:
             clear_skeleton(rs, rl, rt)
 
-        # Cube
         cube_row = _latest_before(cube_rows, t)
         if cube_row:
             pose = np.asarray(cube_row["pose_world"], dtype=float)
@@ -292,7 +288,7 @@ def main():
             paths.append(Path(a))
 
     if not paths:
-        print("Usage: python -m scripts.apps.replay_sequence <session_dir> [--raw] [--speed N]")
+        print("Usage: python -m scripts.visualization.inspect_capture <session_dir> [--raw] [--speed N]")
         sys.exit(1)
 
     for p in paths:

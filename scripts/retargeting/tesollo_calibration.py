@@ -1,12 +1,10 @@
 """Calibration constants shared by the offline retargeter and runtime teleop.
 
-These values are produced by:
-    scripts/calibration/optimize_wrist_offset.py    →  DEFAULT_WRIST_OFFSET
-    scripts/calibration/optimize_finger_offsets.py  →  OFFLINE_TARGET_OFFSETS
+DEFAULT_WRIST_OFFSET is produced by:
+    scripts/calibration/optimize_wrist_offset.py
 
-They live in their own module so both the offline pipeline (which has been
-rewritten to a SPIDER-style equality IK) and the runtime mink-based teleop
-apps can import them without coupling to either retargeter.
+It lives here so both the offline pipeline and the runtime mink-based teleop
+can import it without coupling to either retargeter.
 """
 
 from __future__ import annotations

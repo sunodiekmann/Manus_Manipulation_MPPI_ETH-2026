@@ -1,6 +1,6 @@
-# Tesollo Robohand — Teleoperation & Sequence Replay Pipeline
+# Robohand2 — Motion Capture & Retargeting Pipeline
 
-End-to-end pipeline for capturing hand-object interactions with Manus Quantum Gloves and ArUco tag-based pose estimation, retargeting them to the Tesollo robotic hand via an IK solver, and replaying the sequences in a MuJoCo simulation.
+End-to-end pipeline for capturing human hand–object interactions with Manus Quantum Gloves and ArUco tag-based pose estimation, retargeting them to the Tesollo robotic hand, and optimising dynamically feasible trajectories in MuJoCo.
 
 ---
 
@@ -9,12 +9,10 @@ End-to-end pipeline for capturing hand-object interactions with Manus Quantum Gl
 1. [System overview](#system-overview)
 2. [Installation](#installation)
 3. [Hardware setup](#hardware-setup)
-   - [Tag pose estimation](#tag-pose-estimation)
-   - [Manus Quantum Gloves](#manus-quantum-gloves)
 4. [Calibration](#calibration)
-5. [Live teleoperation](#live-teleoperation)
-6. [Recording & processing](#recording--processing)
-7. [Offline retargeting](#offline-retargeting)
+5. [Main workflows](#main-workflows)
+6. [Sub-step details](#sub-step-details)
+7. [Visualization](#visualization)
 8. [Evaluation](#evaluation)
 9. [Script reference](#script-reference)
 
@@ -23,19 +21,30 @@ End-to-end pipeline for capturing hand-object interactions with Manus Quantum Gl
 ## System overview
 
 ```
-Manus gloves ──► hand skeleton + ergonomics (ZMQ)  ─┐
-                                                      ├─► LiveInputs ──► retargeting (IK) ──► MuJoCo viewer
-ArUco cameras ──► board + cube poses (ZMQ) ──────────┘
+┌─────────────────── Pre-session (once per setup) ────────────────────┐
+│  Camera calibration + Manus calibration + wrist offset calibration  │
+└─────────────────────────────────────────────────────────────────────┘
 
-Recording:
-  Raw JSONL streams ──► build_sequence_dataset ──► compute_proxy_geometry
-                                                         │
-                                          retarget_sequence_baseline
-                                                         │
-                                          replay in MuJoCo / save video
+┌─────────── Stage 1: scripts/capture_motion.py ───────────┐
+│  record_session  →  build_sequence_dataset               │
+│                  →  compute_proxy_geometry                │
+└───────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌──────────── scripts/retarget_motion.py ──────────────────┐
+│  Stage 2:   kinematic_retargeting   (SPIDER equality IK) │
+│  Stage 2.5: detect_contacts         (physics replay)     │
+│  Stage 3:   optimize_sequence_dynamic (MPPI MPC)         │
+└───────────────────────────────────────────────────────────┘
 ```
 
-The world frame is defined by a fixed ArUco board on the table.  The left and right glove boards are tracked relative to this frame, and a calibration matrix maps each glove board to the wrist joint of the corresponding hand.  A 6 cm cube with an ArUco board is tracked as the manipulation object.
+**World frame**: defined by a fixed ArUco board on the table. Glove boards and the cube board are tracked relative to this frame. A calibration matrix maps each glove board to the corresponding hand's wrist joint.
+
+**Pipeline stages:**
+- **Stage 1 (capture)**: Records raw streams from the Manus gloves and pose estimator, resamples and filters to a clean 20 Hz timeline, and computes per-frame fingertip geometry.
+- **Stage 2 (kinematic)**: SPIDER equality-constraint IK maps the human wrist pose and finger configuration to robot joint angles, frame by frame.
+- **Stage 2.5 (contacts)**: physics replay detects which fingertips are in contact with the cube at each frame, building a contact schedule for Stage 3.
+- **Stage 3 (dynamic)**: MPPI sampling-based MPC rolls out trajectories in a full physics simulation (cube as a free joint, fingers must grip under gravity) to produce dynamically feasible joint angles.
 
 ---
 
@@ -46,116 +55,92 @@ git clone <this-repo>
 cd robohand2
 git submodule update --init --recursive
 uv sync
+source .venv/bin/activate
 ```
+
+All commands use `python -m scripts.<module>` (absolute import paths from the repo root) and must be run with the virtual environment active.
+
+### GPU backend (recommended)
+
+Stage 3 (MPPI) supports an NVIDIA Warp GPU backend (`--backend mjwp`) that is significantly faster than the default CPU rollout. It requires:
+
+- NVIDIA GPU
+- CUDA 12+
+
+If CUDA is available, prefer `--backend mjwp` for Stage 3. The CPU backend is always available as a fallback.
 
 ---
 
 ## Hardware setup
 
-### Tag pose estimation
+### Starting the Manus client and pose estimation
 
-All commands below are run from inside `src/tag-pose-estimation/`.
-
-#### 1 — Intrinsic camera calibration
-
-Run once per camera.  Hold a ChArUco board in front of the camera at various angles and distances; press `s` to capture a frame, `q` when done.
+A convenience script launches both services in separate terminals:
 
 ```bash
+bash setup.sh
+```
+
+This starts the Manus SDK client (integrated mode, auto-confirms the mode prompt) and the ArUco pose estimation server. Both must be running before any recording or live teleop script. `setup.sh` is the standard way to bring up the hardware stack at the start of a session.
+
+### Tag pose estimation (one-time setup)
+
+Camera and board calibration only needs to be redone when the physical setup changes. All commands run from `src/tag-pose-estimation/`.
+
+```bash
+# 1. Intrinsic calibration — run once per camera
 python scripts/camera_intrinsic_calibration.py \
   --cam_name /dev/video6 \
   --charuco_board_path config/calibration_boards/default_intrinsic_calibration_board/charuco_board.json
-```
 
-Use `--focus <value>` if autofocus needs to be locked.  Results are saved into the camera config file.
-
-#### 2 — Build object boards
-
-Each tracked object (left glove, right glove, cube) needs a board config that describes the 3D layout of its ArUco markers.  Place the object flat, run pose estimation briefly to detect the markers, then build the board:
-
-```bash
+# 2. Build object boards (run once per physical board)
 python scripts/build_object_board.py \
-  --marker_size 0.05 \
-  --reference_marker <anchor_marker_id> \
-  --name cube_7cm
-```
+  --marker_size 0.05 --reference_marker <id> --name cube_7cm
 
-Existing board configs are in `config/object_boards/` (e.g. `cube_7cm.json`, `hand_tracking_left.json`).
-
-#### 3 — Visualise a board
-
-Sanity-check the marker layout of any board config before using it:
-
-```bash
-python scripts/visualise_board.py \
-  --filepath config/object_boards/cube_7cm.json
-```
-
-#### 4a — Extrinsic calibration: single camera
-
-Hold a ChArUco board in view and move it around.  Establishes the camera-to-world transform.
-
-```bash
-python scripts/calibrate_extrinsics_single_camera.py \
-  --camera_config_path config/camera_config/realsense_1_config.json \
-  --board_config_path config/calibration_boards/default_intrinsic_calibration_board/charuco_board.json
-```
-
-#### 4b — Extrinsic calibration: dual camera
-
-Calibrates two cameras jointly so they share a common world frame.
-
-```bash
+# 3. Extrinsic calibration
 python scripts/calibrate_extrinsics_dual_camera.py \
   --camera_1_config_path config/camera_config/realsense_1_config.json \
   --camera_2_config_path config/camera_config/realsense_2_config.json \
   --board_config_path config/calibration_boards/default_intrinsic_calibration_board/charuco_board.json
 ```
 
-#### 5 — Run pose estimation
-
-Starts the pose estimator, opens live camera streams, and publishes board poses over ZMQ.  This must be running before any teleop or recording script.
-
-```bash
-python scripts/run_pose_estimation.py \
-  --config config/pose_estimation_configs/manus_pose_estimation_config.json
-```
-
-The config file controls which cameras, which boards to track, the output ZMQ address, and whether to stream images.  Current setup: two RealSense cameras, ~15 Hz, three boards tracked (left glove, right glove, cube).
-
 ### Manus Quantum Gloves
 
 1. Connect the license USB dongle and the Bluetooth receiver.
-2. Power on the gloves.  Steady blue LED = connected.
-3. Start the Manus client in integrated mode:
-   ```bash
-   # in src/manus/LinuxClient
-   ./ManusCoreConsumer    # then press 1 for integrated mode
-   ```
-4. Verify streaming by running a teleop script (see below).
-5. For a new user, redo the hand calibration following the [Manus calibration guide](https://docs.manus-meta.com/2.4.0/Products/XR%20Metagloves/Calibration/).
+2. Power on the gloves (steady blue LED = connected).
+3. Run `bash setup.sh` (see above) — this handles the Manus client startup.
+4. For a new user, follow the [Manus calibration guide](https://docs.manus-meta.com/2.4.0/Products/XR%20Metagloves/Calibration/).
 
 ---
 
 ## Calibration
 
-Calibration maps each glove's wrist joint to its ArUco tracking board.  There are two stages:
+Calibration maps each glove's wrist joint to its tracking board. Run these steps once per physical setup change.
 
-### Stage 1 — Coarse wrist-to-board calibration
+### Coarse wrist-to-board transform
 
-Point the fingertips at known world-frame positions with the glove flat.  The script fits a rigid transform from wrist frame to board frame.
+Point the fingertips at known world-frame positions with the glove flat:
 
 ```bash
 python -m scripts.calibration.estimate_wrist_to_board
 ```
 
-Results are saved to `src/tag-pose-estimation/config/calibration_gloves/`.
+Results saved to `src/tag-pose-estimation/config/calibration_gloves/`.
 
-### Stage 2 — Fine hand-object alignment optimisation
+### Fine hand-object alignment
 
-With the fingertips placed on the faces of the cube, this script optimises the calibration matrix so that the tracked fingertips lie on the cube surface.  Produces `T_board_wrist_optimized`, which is loaded automatically by all downstream scripts.
+With fingertips placed on the cube faces, optimises the calibration so tracked tips lie on the cube surface:
 
 ```bash
 python -m scripts.calibration.optimize_hand_object_alignment
+```
+
+### Wrist offset calibration
+
+Optimises the translational offset between the glove board and the robot wrist joint. The resulting constant (`DEFAULT_WRIST_OFFSET`) lives in `scripts/retargeting/tesollo_calibration.py` and is loaded automatically by all downstream scripts.
+
+```bash
+python -m scripts.calibration.optimize_wrist_offset
 ```
 
 ### Verify calibration quality
@@ -164,181 +149,269 @@ python -m scripts.calibration.optimize_hand_object_alignment
 python -m scripts.evaluation.compute_calibration_metrics recordings/statics
 ```
 
-Prints per-finger signed distance to the nearest cube face (should be close to 0 mm) and a bar chart of the error distribution.
+Prints per-finger signed distance to the nearest cube face (target: < 3 mm).
 
 ---
 
-## Live teleoperation
+## Main workflows
 
-All scripts below require the Manus client and pose estimation to be running first.
-
-### Skeleton visualisation (matplotlib, no robot)
-
-Plots the hand skeleton and cube in real time — useful for verifying streams before running the IK.
+### Stage 1 — Capture a motion
 
 ```bash
-# World frame (hands + cube relative to table)
-python -m scripts.apps.run_manus_teleop_world
+# Record a new session and preprocess in one step
+python -m scripts.capture_motion
 
-# Wrist frame (hand relative to glove board)
-python -m scripts.apps.run_manus_teleop_wrist
+# Reprocess an already-recorded session
+python -m scripts.capture_motion recordings/<session>
+
+# Force reprocessing
+python -m scripts.capture_motion recordings/<session> --force
+
+# Process and inspect the result
+python -m scripts.capture_motion recordings/<session> --inspect
+
+# Inspect the raw streams without reprocessing
+python -m scripts.capture_motion recordings/<session> --inspect-raw
 ```
 
-### IK retargeting to Tesollo hand (MuJoCo viewer)
+Recording requires the Manus client and pose estimation server to be running (`bash setup.sh`).
 
-Runs the full inverse-kinematics pipeline and shows the retargeted robot hand in the MuJoCo passive viewer.
-
-```bash
-# World frame — hand tracks the physical wrist position in space
-python -m scripts.apps.run_tesollo_teleop_world
-
-# Wrist frame — hand tracks finger configuration only, ignores wrist pose
-python -m scripts.apps.run_tesollo_teleop_wrist
-```
+**What it does:**
+1. `record_session` — streams `hands.jsonl`, `ergonomics.jsonl`, `poses.jsonl` to `recordings/session_YYYYMMDD_HHMMSS/`
+2. `build_sequence_dataset` — resamples to 20 Hz, filters, rejects outliers, computes wrist transforms → `processed_sequence.npz`
+3. `compute_proxy_geometry` — adds fingertip positions and directions in wrist/world/cube frames → `processed_sequence_with_proxy.npz`
 
 ---
 
-## Recording & processing
-
-### 1 — Record a session
-
-Records all streams (hand skeleton, ergonomics, board + cube poses) to timestamped JSONL files under `recordings/<session>/`.
+### Stages 2–3 — Retarget a motion
 
 ```bash
-python -m scripts.apps.record_demo_sequence
+# Full 3-stage retargeting pipeline (CPU backend)
+python -m scripts.retarget_motion recordings/<session>
+
+# GPU backend — much faster for Stage 3, requires CUDA 12+
+python -m scripts.retarget_motion recordings/<session> --backend mjwp
+
+# Force re-run all stages
+python -m scripts.retarget_motion recordings/<session> --force
+
+# Tagged run (does not overwrite canonical outputs)
+python -m scripts.retarget_motion recordings/<session> --tag my_run
+
+# Set MPPI random seed
+python -m scripts.retarget_motion recordings/<session> --seed 42
+
+# Skip stages for debugging (e.g. contacts already done, re-run Stage 3 only)
+python -m scripts.retarget_motion recordings/<session> --skip-kinematic
+python -m scripts.retarget_motion recordings/<session> --skip-kinematic --skip-contacts
+
+# Run and open the MuJoCo viewer when done
+python -m scripts.retarget_motion recordings/<session> --inspect
 ```
 
-Output: `recordings/session_YYYYMMDD_HHMMSS/{hands,ergonomics,poses}.jsonl`
+**What it does:**
 
-### 2 — Inspect raw data
+| Stage | Script | Input | Output |
+|---|---|---|---|
+| 2 | `kinematic_retargeting` | `processed_sequence_with_proxy.npz` | `retargeted_sequence[__<tag>].npz` |
+| 2.5 | `detect_contacts` | `retargeted_sequence.npz` | `contact_sequence[__<tag>].npz` |
+| 3 | `optimize_sequence_dynamic` | both above | `retargeted_sequence_dynamic[__<tag>].npz` |
 
-Plots raw stream timestamps, arrival rates, and pose trajectories directly from the JSONL files — useful for diagnosing recording issues before processing.
+The `--tag` flag consistently suffixes all three output files so parameter-sweep runs never overwrite the canonical ones. For MPPI tuning knobs (`--horizon`, `--num-samples`, `--iters`, `--w-*`, …), call `optimize_sequence_dynamic` directly.
+
+---
+
+## Sub-step details
+
+Each stage can be run in isolation for debugging.
+
+### Stage 2 — Kinematic retargeting
 
 ```bash
-python -m scripts.apps.replay_sequence recordings/<session> --raw
-
-# Or use the dedicated inspector for detailed diagnostics
-python -m scripts.processing.inspect_raw_sequence recordings/<session>
+python -m scripts.retargeting.kinematic_retargeting recordings/<session>
+python -m scripts.retargeting.kinematic_retargeting recordings/<session> --force
+python -m scripts.retargeting.kinematic_retargeting recordings/<session> --viewer
+python -m scripts.retargeting.kinematic_retargeting recordings/<session> --tag cube_shift \
+    --cube-shift 0.02 0 -0.01
 ```
 
-### 3 — Process the recording
+SPIDER equality-constraint IK — maps each frame of the processed sequence to a robot joint configuration. The `--viewer` flag opens the MuJoCo passive viewer while solving.
 
-The processing pipeline resamples all streams to a uniform 20 Hz timeline, rejects pose outliers (false ArUco detections), applies low-pass filtering, and computes world-frame transforms.
+**Key flags:**
 
-**Orchestrator — runs all steps, skips those already done:**
+| Flag | Description |
+|---|---|
+| `--force` | Overwrite existing output |
+| `--viewer` | Show MuJoCo viewer during IK |
+| `--tag TAG` | Write to `retargeted_sequence__TAG.npz` |
+| `--cube-shift X Y Z` | Shift cube target in wrist frame (m) |
+| `--cube-edge M` | Override cube edge length (m) |
+| `--pin-wrist` | Lock wrist to reference pose |
+
+---
+
+### Stage 2.5 — Contact detection
 
 ```bash
-# Process a single session
-python -m scripts.apps.process_recordings recordings/<session>
-
-# Process all sessions found under recordings/
-python -m scripts.apps.process_recordings
-
-# Force re-run even if outputs exist
-python -m scripts.apps.process_recordings recordings/<session> --force
-
-# Process then open the processed inspector
-python -m scripts.apps.process_recordings recordings/<session> --inspect
-
-# Open the raw inspector without (re)processing
-python -m scripts.apps.process_recordings recordings/<session> --inspect-raw
+python -m scripts.retargeting.detect_contacts recordings/<session>
+python -m scripts.retargeting.detect_contacts recordings/<session> --force --stats
+python -m scripts.retargeting.detect_contacts recordings/<session> \
+    --stage2-tag my_run --tag my_run
 ```
 
-**Individual steps:**
+Physics replay in MuJoCo that detects tip-cube collisions at each Stage 2 frame, then segments continuous contact intervals into a per-finger contact schedule.
+
+**Key flags:**
+
+| Flag | Description |
+|---|---|
+| `--force` | Overwrite existing output |
+| `--stage2-tag TAG` | Read from `retargeted_sequence__TAG.npz` |
+| `--tag TAG` | Write to `contact_sequence__TAG.npz` |
+| `--sd-threshold M` | Signed-distance threshold for contact mask (m) |
+| `--stats` | Print per-finger contact statistics |
+
+---
+
+### Stage 3 — Dynamic optimisation (MPPI)
 
 ```bash
-# Step 1: resample, filter, compute wrist transforms
-python -m scripts.processing.build_sequence_dataset recordings/<session>
-
-# Step 2: derive fingertip positions and directions in wrist, world, and cube frames
-python -m scripts.processing.compute_proxy_geometry recordings/<session>/processed_sequence.npz
+python -m scripts.retargeting.optimize_sequence_dynamic recordings/<session>
+python -m scripts.retargeting.optimize_sequence_dynamic recordings/<session> --force --seed 42
+python -m scripts.retargeting.optimize_sequence_dynamic recordings/<session> \
+    --tag sweep_h8 --horizon 8 --num-samples 2048 --iters 32
 ```
 
-Output:
-- `processed_sequence.npz` — uniform timeline, filtered poses, wrist transforms, joints, ergonomics
-- `processed_sequence_with_proxy.npz` — adds fingertip positions/directions in all frames
+MPPI sampling-based MPC that rolls out finger and wrist controls in full physics (cube as free joint, no virtual stick), optimising for cube tracking and contact quality.
 
-### 4 — Inspect processed data
+**Key flags (selection):**
 
-```bash
-# Animated 3D plot of hand skeleton + cube (loops)
-python -m scripts.apps.replay_sequence recordings/<session>
-python -m scripts.apps.replay_sequence recordings/<session> --speed 2.0
-
-# Static diagnostic plots (trajectories, speeds, orientation jumps)
-python -m scripts.processing.inspect_processed_sequence recordings/<session>
-```
-
-### Processing parameters
-
-Key constants at the top of `scripts/processing/build_sequence_dataset.py`:
-
-| Parameter | Default | Description |
+| Flag | Default | Description |
 |---|---|---|
-| `TARGET_HZ` | 20 Hz | Resampling frequency |
-| `OUTLIER_MAX_POS_JUMP_M` | 0.06 m | Reject pose frames jumping more than this |
-| `OUTLIER_MAX_ROT_JUMP_DEG` | 20° | Reject pose frames rotating more than this |
-| `FILTER_HZ_POSES` | 3 Hz | Low-pass cutoff for board/cube poses |
-| `FILTER_HZ_HANDS` | 8 Hz | Low-pass cutoff for hand joints and ergonomics |
+| `--force` | — | Overwrite existing output |
+| `--seed N` | 0 | Random seed |
+| `--tag TAG` | — | Write to `retargeted_sequence_dynamic__TAG.npz` |
+| `--stage2-tag TAG` | — | Read tagged Stage 2/2.5 inputs |
+| `--horizon N` | 4 | MPPI planning horizon (steps) |
+| `--num-samples N` | 1024 | MPPI sample count |
+| `--iters N` | 16 | MPPI iterations per tick |
+| `--num-knots N` | — | Spline knots (default: horizon) |
+| `--substeps N` | 40 | Physics substeps per MPC step |
+| `--sim-dt S` | 0.005 | Simulation timestep (s) |
+| `--cube-edge M` | — | Override cube edge length (m) |
+| `--cube-mass KG` | — | Override cube mass (kg) |
+| `--w-cube-pos` | — | Cube position reward weight |
+| `--w-cube-quat` | — | Cube rotation reward weight |
+| `--start-time S` | 0.0 | Skip to this reference time (s) |
+| `--max-ticks N` | 0 | Limit tick count (0 = full) |
+| `--diagnostics` | — | Print per-term reward diagnostics |
+| `--backend` | cpu | Rollout backend: `cpu` or `mjwp` (NVIDIA Warp GPU, requires CUDA 12+) |
 
 ---
 
-## Offline retargeting
+## Visualization
 
-Processes a recorded session through the same IK pipeline as live teleop, producing retargeted robot joint angles for every frame.
+All visualization scripts are in `scripts/visualization/`.
 
-### Run retargeting
-
-```bash
-# Retarget and save (headless, fastest)
-python -m scripts.retargeting.retarget_sequence_baseline recordings/<session>
-
-# Retarget with live MuJoCo viewer
-python -m scripts.retargeting.retarget_sequence_baseline recordings/<session> --viewer
-
-# Retarget and immediately save a video
-python -m scripts.retargeting.retarget_sequence_baseline recordings/<session> --save-video
-
-# Force re-run if output already exists
-python -m scripts.retargeting.retarget_sequence_baseline recordings/<session> --force
-```
-
-Output: `recordings/<session>/retargeted_sequence_baseline.npz`  
-Keys: `timeline (N,)`, `retargeted_qpos (N, nq)`
-
-### Replay retargeted sequence
+### Stage 1 — Capture inspection
 
 ```bash
-# Interactive MuJoCo viewer (loops)
-python -m scripts.retargeting.retarget_sequence_baseline recordings/<session> --replay
+# Interactive matplotlib animation of the processed session
+python -m scripts.visualization.inspect_capture recordings/<session>
+python -m scripts.visualization.inspect_capture recordings/<session> --raw   # raw streams
+python -m scripts.visualization.inspect_capture recordings/<session> --speed 2.0
 
-# Replay and render to MP4 (requires: pip install imageio[ffmpeg])
-python -m scripts.retargeting.retarget_sequence_baseline recordings/<session> --replay --save-video
+# Static diagnostic plots — raw streams (timestamps, rates, pose trajectories)
+python -m scripts.visualization.inspect_capture_raw recordings/<session>
+
+# Static diagnostic plots — processed sequence (trajectories, speeds, jumps)
+python -m scripts.visualization.inspect_capture_processed recordings/<session>
 ```
 
-Output: `recordings/<session>/retargeted_sequence_baseline.mp4`
+### Stages 2–3 — Retargeting inspection
+
+```bash
+# Replay Stage 3 dynamic output in MuJoCo (orange ghost = MPC reference cube)
+python -m scripts.visualization.inspect_retargeting recordings/<session>
+python -m scripts.visualization.inspect_retargeting recordings/<session> --speed 0.5
+python -m scripts.visualization.inspect_retargeting recordings/<session> --no-ref
+python -m scripts.visualization.inspect_retargeting recordings/<session> --tag my_run
+
+# Replay Stage 2 kinematic output
+python -m scripts.visualization.inspect_retargeting recordings/<session> --stage2
+
+# Preview a cube-shift in Stage 2 (green ghost = shifted target)
+python -m scripts.visualization.inspect_retargeting recordings/<session> --stage2 \
+    --cube-shift 0.02 0 -0.01
+```
+
+### Contact schedule
+
+```bash
+# Per-finger contact schedule plot (face assignment, contact mask, signed distance)
+python -m scripts.visualization.plot_contact_schedule recordings/<session>
+```
+
+### Live teleop (require `bash setup.sh` first)
+
+```bash
+# Hand skeleton in world frame (matplotlib, no robot)
+python -m scripts.visualization.live_skeleton_world
+
+# Hand skeleton in wrist frame (matplotlib, no robot)
+python -m scripts.visualization.live_skeleton_wrist
+
+# IK retargeting to Tesollo — world frame (MuJoCo viewer)
+python -m scripts.visualization.live_teleop_world
+
+# IK retargeting to Tesollo — wrist frame (MuJoCo viewer)
+python -m scripts.visualization.live_teleop_wrist
+
+# IK retargeting to Tesollo — cube frame (MuJoCo viewer)
+# --offset overrides the DEFAULT_WRIST_OFFSET (XYZ in metres, wrist-frame
+# translation from the tracked board to the robot wrist joint)
+python -m scripts.visualization.live_teleop_cube
+python -m scripts.visualization.live_teleop_cube --offset 0.004 0.006 -0.027
+```
 
 ---
 
 ## Evaluation
 
-### Retargeting quality
+### Single recording
 
-Compares robot fingertip positions (from forward kinematics) to human fingertip positions, both expressed in the cube frame.  Per-finger position error in mm.
+Computes all retargeting metrics for one session and shows diagnostic plots:
 
 ```bash
-# Single session
-python -m scripts.evaluation.compute_retargeting_metrics recordings/<session>
-
-# All sessions that have a retargeted file
-python -m scripts.evaluation.compute_retargeting_metrics recordings/
+python -m scripts.evaluation.evaluate_recording recordings/<session>
+python -m scripts.evaluation.evaluate_recording recordings/<session> --tag my_run
 ```
 
-Plots: per-finger error time series + mean ± std bar chart.
+Prints a metric table and shows three plots: rotation error per tick, position error per tick, and off-axis wobble vs reference.
 
-### Calibration quality (static poses)
+**Metrics:**
 
-Measures how well the calibrated fingertip positions lie on the cube surface.
+| Metric | Description |
+|---|---|
+| `success` | Completed without any tick exceeding 100 mm position error |
+| `rot_mean / rot_max` | Mean / max rotation error (deg) |
+| `pos_mean / pos_max` | Mean / max position error (mm) |
+| `C_par` | Along-axis rotation coverage (deg) |
+| `C_perp` | Off-axis / wobble coverage (deg) |
+| `fin_geo` | Final geodesic error (deg) |
+| `wall_s` | Wall-clock runtime (s) |
+
+### Sweep analysis (thesis results)
+
+Loads results from multiple sweep runs and generates comparison figures:
+
+```bash
+python -m scripts.evaluation.analyze_sweeps
+```
+
+Reads from the paths configured at the top of the script. Produces `documents/figures/`.
+
+### Calibration quality
 
 ```bash
 python -m scripts.evaluation.compute_calibration_metrics recordings/statics
@@ -348,44 +421,111 @@ python -m scripts.evaluation.compute_calibration_metrics recordings/statics
 
 ## Script reference
 
-### `scripts/apps/` — runnable applications
+### Top-level orchestrators
 
 | Script | Purpose |
 |---|---|
-| `record_demo_sequence.py` | Record a session to JSONL files |
-| `process_recordings.py` | Orchestrate the full processing pipeline |
-| `replay_sequence.py` | Animate a session in matplotlib (`--raw` for unprocessed) |
-| `run_manus_teleop_world.py` | Live hand skeleton visualisation, world frame |
-| `run_manus_teleop_wrist.py` | Live hand skeleton visualisation, wrist frame |
-| `run_tesollo_teleop_world.py` | Live IK retargeting, world frame, MuJoCo viewer |
-| `run_tesollo_teleop_wrist.py` | Live IK retargeting, wrist frame, MuJoCo viewer |
+| `scripts/capture_motion.py` | Stage 1: record + preprocess a session |
+| `scripts/retarget_motion.py` | Stages 2–3: full retargeting pipeline |
 
-### `scripts/calibration/` — calibration
+### `scripts/processing/`
 
 | Script | Purpose |
 |---|---|
-| `estimate_wrist_to_board.py` | Coarse wrist-to-board transform from known finger positions |
-| `optimize_hand_object_alignment.py` | Fine-tune calibration using cube surface contacts |
-
-### `scripts/processing/` — data processing
-
-| Script | Purpose |
-|---|---|
+| `record_session.py` | Record raw JSONL streams from Manus + pose estimator |
 | `build_sequence_dataset.py` | Resample, filter, outlier-reject, compute wrist transforms |
-| `compute_proxy_geometry.py` | Add fingertip positions/directions in all frames |
-| `inspect_raw_sequence.py` | Diagnostic plots from raw JSONL streams |
-| `inspect_processed_sequence.py` | Diagnostic plots from processed sequence |
+| `compute_proxy_geometry.py` | Add fingertip positions/directions in wrist/world/cube frames |
 
-### `scripts/retargeting/` — offline retargeting
+### `scripts/retargeting/`
 
 | Script | Purpose |
 |---|---|
-| `retarget_sequence_baseline.py` | IK retargeting of a recorded session; replay and video export |
+| `kinematic_retargeting.py` | Stage 2: SPIDER equality-constraint IK |
+| `detect_contacts.py` | Stage 2.5: physics-replay contact detection |
+| `optimize_sequence_dynamic.py` | Stage 3: MPPI dynamic optimisation |
+| `build_ik_scene.py` | Build MuJoCo XML for the IK scene |
+| `tesollo_calibration.py` | Wrist offset calibration constant (single source of truth) |
+| `tesollo_target_mapping.py` | Maps human joint angles to robot targets |
+| `tesollo_mink_ik.py` | Mink-based IK solver (used by live teleop and calibration) |
+| `dynamic_retargeting/` | MPPI core: `mppi.py`, `cpu_env.py`, `mjwp_env.py`, `reward.py` |
 
-### `scripts/evaluation/` — metrics
+### `scripts/visualization/`
 
 | Script | Purpose |
 |---|---|
-| `compute_calibration_metrics.py` | Fingertip-to-cube-surface distance for static poses |
-| `compute_retargeting_metrics.py` | Robot vs. human fingertip error in cube frame |
-| `compute_simulation_metrics.py` | *(placeholder)* |
+| `inspect_capture.py` | Animated matplotlib view of a session (raw or processed) |
+| `inspect_capture_raw.py` | Static diagnostic plots from raw JSONL streams |
+| `inspect_capture_processed.py` | Static diagnostic plots from processed sequence |
+| `inspect_retargeting.py` | MuJoCo viewer for Stage 2 or Stage 3 output |
+| `plot_contact_schedule.py` | Per-finger contact schedule visualization |
+| `live_skeleton_world.py` | Live Manus hand skeleton, world frame |
+| `live_skeleton_wrist.py` | Live Manus hand skeleton, wrist frame |
+| `live_teleop_world.py` | Live IK retargeting, world frame |
+| `live_teleop_wrist.py` | Live IK retargeting, wrist frame |
+| `live_teleop_cube.py` | Live IK retargeting, cube frame (optional `--offset` for wrist offset) |
+
+### `scripts/calibration/`
+
+| Script | Purpose |
+|---|---|
+| `estimate_wrist_to_board.py` | Coarse wrist-to-board transform from known fingertip positions |
+| `optimize_hand_object_alignment.py` | Fine-tune calibration using cube surface contacts |
+| `optimize_wrist_offset.py` | Optimise wrist position offset |
+
+### `scripts/evaluation/`
+
+| Script | Purpose |
+|---|---|
+| `evaluate_recording.py` | Metrics + plots for a single retargeted session |
+| `analyze_sweeps.py` | Multi-run sweep analysis (thesis results) |
+| `metrics.py` | Shared metric helpers (imported by both above) |
+| `compute_calibration_metrics.py` | Calibration quality: fingertip-to-cube-surface error |
+
+### `scripts/streams/`
+
+| Script | Purpose |
+|---|---|
+| `live_inputs.py` | Unified ZMQ subscriber for all live data streams |
+| `manus_skeleton_receiver.py` | Manus hand skeleton + fingertip receiver |
+| `manus_ergonomics_receiver.py` | Manus ergonomics receiver |
+| `board_pose_listener.py` | ArUco board pose subscriber |
+| `image_listener.py` | Camera image subscriber |
+
+### `scripts/utils/`
+
+| Script | Purpose |
+|---|---|
+| `config.py` | Global constants (ports, board IDs, cube size, …) |
+| `transforms.py` | SE(3) utility functions |
+
+---
+
+## Output file structure
+
+After a complete run, a session directory contains:
+
+```
+recordings/session_YYYYMMDD_HHMMSS/
+├── hands.jsonl                              # raw Manus hand stream
+├── ergonomics.jsonl                         # raw Manus ergonomics stream
+├── poses.jsonl                              # raw ArUco pose stream
+├── meta.json                                # recording metadata
+├── processed_sequence.npz                  # Stage 1: resampled + filtered timeline
+├── processed_sequence_with_proxy.npz       # Stage 1: + fingertip proxy geometry
+├── retargeted_sequence.npz                 # Stage 2: kinematic IK
+├── contact_sequence.npz                    # Stage 2.5: contact schedule
+├── retargeted_sequence_dynamic.npz         # Stage 3: MPPI output (canonical)
+└── retargeted_sequence_dynamic__<tag>.npz  # Stage 3: tagged sweep runs
+```
+
+**Key arrays in `retargeted_sequence_dynamic.npz`:**
+
+| Array | Shape | Description |
+|---|---|---|
+| `timeline` | `(N,)` | Wall-clock timestamps (s) |
+| `retargeted_qpos` | `(N, 27)` | Hand joint angles at each tick |
+| `cube_traj` | `(N, 7)` | Simulated cube pose (xyz + wxyz) |
+| `cube_ref_used` | `(N, 7)` | MPC reference cube pose at each tick |
+| `pos_err_history` | `(N,)` | Cube position error (m) |
+| `rot_err_history` | `(N,)` | Cube rotation error (rad) |
+| `run_config` | scalar JSON | All MPPI parameters used |

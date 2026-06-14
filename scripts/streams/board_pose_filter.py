@@ -5,7 +5,7 @@ import collections
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 
-from utils.transforms import (
+from scripts.utils.transforms import (
     rotation_matrix_to_quaternion,
 )
 

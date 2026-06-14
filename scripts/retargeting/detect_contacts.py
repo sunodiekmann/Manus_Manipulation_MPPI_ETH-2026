@@ -31,8 +31,8 @@ Output:
         finger_names                       — thumb/index/middle/ring/little
 
 Usage:
-    python -m scripts.retargeting.spider_contact recordings/<session>
-    python -m scripts.retargeting.spider_contact recordings/cube_pitch recordings/cube_roll recordings/cube_yaw --stats
+    python -m scripts.retargeting.detect_contacts recordings/<session>
+    python -m scripts.retargeting.detect_contacts recordings/cube_pitch recordings/cube_roll recordings/cube_yaw --stats
 """
 import sys
 from pathlib import Path
@@ -435,45 +435,6 @@ def _print_stats(name: str, mask: np.ndarray, timeline: np.ndarray,
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
-def _apply_manual_constraints(
-    constraints,                # (N, 5) of {-2, -1, 0..5} from manual_contacts.load_constraints
-    mask: np.ndarray,            # (N, 5) bool — pre-constraint contact mask
-    pos_cube: np.ndarray,        # (N, 5, 3) — fingertip cube-frame positions
-    target_per_frame: np.ndarray, # (N, 5, 3) — segmented contact target (will be patched)
-    cube_half_m: float = None,
-):
-    """Enforce manual constraints on the detection output:
-
-    - FORBIDDEN (-2): set mask=False; clear target.
-    - Face-bound (0..5): if mask is True, project the per-frame target onto
-      the constrained face (the segmenter may have chosen a neighbouring
-      face due to noise — manual wins).
-    """
-    if constraints is None:
-        return mask, target_per_frame
-    from scripts.retargeting.manual_contacts import FORBIDDEN, project_target_onto_face
-
-    out_mask = mask.copy()
-    out_target = target_per_frame.copy()
-    N, F = mask.shape
-    for t in range(N):
-        for f in range(F):
-            code = int(constraints[t, f])
-            if code == FORBIDDEN:
-                out_mask[t, f] = False
-                out_target[t, f] = np.nan
-                continue
-            if code >= 0 and mask[t, f]:
-                # If the per-frame target is NaN (segmenter dropped it for
-                # being a short phase) we leave it NaN — but the mask stays.
-                tgt = out_target[t, f]
-                if not np.any(np.isnan(tgt)):
-                    out_target[t, f] = project_target_onto_face(
-                        tgt, code,
-                        cube_half_m if cube_half_m is not None else _CUBE_HALF)
-    return out_mask, out_target
-
-
 def detect_contact_session(
     session_dir: Path,
     force: bool = False,
@@ -497,7 +458,7 @@ def detect_contact_session(
     if not retarget_path.exists():
         raise FileNotFoundError(
             f"{retarget_path.name} not found in {session_dir}. "
-            "Run scripts.retargeting.retarget_sequence_spider first."
+            "Run scripts.retargeting.kinematic_retargeting first."
         )
 
     output_path = session_dir / out_name
@@ -540,21 +501,6 @@ def detect_contact_session(
     )
     # Collapse A→B→A segmentation noise.
     target_per_frame = _merge_short_ABA(target_per_frame, MIN_ABA_MERGE_LEN)
-
-    # Manual constraints (optional JSON sidecar): force "no contact" or
-    # "must be on face X" per (finger, time range).
-    from scripts.retargeting.manual_contacts import load_constraints
-    constraints = load_constraints(session_dir, timeline)
-    if constraints is not None:
-        from scripts.retargeting.manual_contacts import FORBIDDEN, UNCONSTRAINED
-        smoothed, target_per_frame = _apply_manual_constraints(
-            constraints, smoothed, pos_cube, target_per_frame,
-            cube_half_m=cube_half_local,
-        )
-        n_forbidden = int((constraints == FORBIDDEN).sum())
-        n_facebound = int((constraints >= 0).sum())
-        print(f"  manual constraints: {n_forbidden} forbid-contact frames, "
-              f"{n_facebound} face-bound frames")
 
     # (Snap is now handled at Stage 2 IK time in tesollo_target_mapping —
     # interior targets are pushed to cube_half + 5 mm margin there. No
@@ -615,7 +561,7 @@ def main():
 
     if not paths:
         print(
-            "Usage: python -m scripts.retargeting.spider_contact <session_dir>..."
+            "Usage: python -m scripts.retargeting.detect_contacts <session_dir>..."
             " [--stats] [--force] [--sd-threshold M]"
         )
         sys.exit(1)

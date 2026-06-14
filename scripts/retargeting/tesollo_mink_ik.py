@@ -1,11 +1,11 @@
 """Mink-based runtime IK for cube-relative live teleop.
 
 Used by:
-    scripts/apps/run_tesollo_teleop_cube.py   — live teleop loop
-    scripts/calibration/optimize_*.py         — calibration fitters
+    scripts/visualization/live_teleop_cube.py  — live teleop loop
+    scripts/calibration/optimize_*.py          — calibration fitters
 
 The *offline* retargeting pipeline uses SPIDER-style equality IK
-(`retarget_sequence_spider.py`); this module exists separately because the
+(`kinematic_retargeting.py`); this module exists separately because the
 runtime loop has different latency/safety requirements and benefits from
 mink's gradient IK with posture priors.
 """

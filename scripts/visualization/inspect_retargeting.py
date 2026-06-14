@@ -13,11 +13,11 @@ Two modes:
   check the shift before running Stage 3.
 
 Usage:
-    python -m scripts.retargeting.replay_dynamic recordings/<session>
-    python -m scripts.retargeting.replay_dynamic recordings/<session> --speed 0.5
-    python -m scripts.retargeting.replay_dynamic recordings/<session> --no-ref
-    python -m scripts.retargeting.replay_dynamic recordings/<session> --stage2
-    python -m scripts.retargeting.replay_dynamic recordings/<session> --stage2 \\
+    python -m scripts.visualization.inspect_retargeting recordings/<session>
+    python -m scripts.visualization.inspect_retargeting recordings/<session> --speed 0.5
+    python -m scripts.visualization.inspect_retargeting recordings/<session> --no-ref
+    python -m scripts.visualization.inspect_retargeting recordings/<session> --stage2
+    python -m scripts.visualization.inspect_retargeting recordings/<session> --stage2 \\
         --cube-shift 0.02 0 -0.01
 """
 from __future__ import annotations
@@ -30,12 +30,13 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-from scripts.retargeting.retarget_sequence_spider import shift_cube_in_wrist_frame
+from scripts.retargeting.kinematic_retargeting import shift_cube_in_wrist_frame
 
 PHYSICS_XML = Path(__file__).resolve().parents[2] / "assets" / "output_mocap_physics.xml"
 
-GHOST_REF_RGBA = (1.0, 0.7, 0.0, 0.6)   # orange — MPC reference
-GHOST_SHIFTED_RGBA = (0.2, 1.0, 0.3, 0.6)  # green — shifted cube preview
+GHOST_REF_RGBA = (1.0, 0.7, 0.0, 0.2)   # orange — MPC reference
+GHOST_SHIFTED_RGBA = (0.2, 1.0, 0.3, 0.7)  # green — shifted cube preview
+CUBE_GEOM_RGBA = (0.0, 0.85, 0.9, 0.95)    # vivid cyan, nearly opaque
 
 
 def _apply_state(model, data, qpos_hand, cube_pose):
@@ -105,8 +106,6 @@ def _load_stage3(session_dir: Path, tag: str | None = None):
         print(f"  [warn] cube_ref_used has {cube_ref.shape[0]} frames vs "
               f"qpos {qpos.shape[0]}; ghost disabled.")
         cube_ref = None
-    # Pull cube_edge_m / cube_mass_kg from run_config so the visual cube
-    # matches what was actually simulated.
     cfg = {}
     if "run_config" in dyn.files:
         import json
@@ -137,14 +136,14 @@ def replay(session_dir: Path, *, speed: float, show_ref: bool, loop: bool,
     N = qpos.shape[0]
     model = mujoco.MjModel.from_xml_path(str(PHYSICS_XML))
     if cube_edge_m is not None or cube_mass_kg is not None:
-        # Mutate the rendered cube to match the run config — otherwise the
-        # cube on screen is always XML default (70 mm, 40 g) regardless of
-        # what was actually simulated.
         from scripts.retargeting.build_ik_scene import apply_cube_geometry
         apply_cube_geometry(model, edge_m=cube_edge_m, mass_kg=cube_mass_kg)
         print(f"  cube override: "
               f"edge={cube_edge_m if cube_edge_m is not None else 'XML'} m  "
               f"mass={cube_mass_kg if cube_mass_kg is not None else 'XML'} kg")
+    cube_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "tracked_cube_geom")
+    if cube_gid >= 0:
+        model.geom_rgba[cube_gid] = CUBE_GEOM_RGBA
     data = mujoco.MjData(model)
 
     dt_per_frame = float(np.diff(timeline).mean()) if N > 1 else 0.05

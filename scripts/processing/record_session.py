@@ -1,3 +1,20 @@
+"""Record a demo session to timestamped JSONL files.
+
+Streams from Manus gloves and the ArUco pose estimator are written to
+`recordings/<session>/` as three JSONL event logs:
+
+    hands.jsonl       — left and right hand skeleton + fingertip poses
+    ergonomics.jsonl  — joint-angle ergonomics data
+    poses.jsonl       — left board, right board, cube board poses
+
+Recording stops automatically after DURATION_SEC seconds, or immediately
+on Ctrl-C.
+
+Requires the Manus client and pose estimation server to be running first.
+
+Usage:
+    python -m scripts.processing.record_session
+"""
 import json
 import time
 from pathlib import Path
@@ -105,9 +122,6 @@ def main():
                 data = live.get_latest(max_age=1.0)
                 did_write = False
 
-                # -------------------------
-                # LEFT HAND SKELETON
-                # -------------------------
                 left_hand_ts = data["left"]["skeleton_timestamp"]
                 if left_hand_ts is not None and left_hand_ts != last_left_hand_ts:
                     sample = {
@@ -123,9 +137,6 @@ def main():
                     hand_count += 1
                     did_write = True
 
-                # -------------------------
-                # RIGHT HAND SKELETON
-                # -------------------------
                 right_hand_ts = data["right"]["skeleton_timestamp"]
                 if right_hand_ts is not None and right_hand_ts != last_right_hand_ts:
                     sample = {
@@ -141,9 +152,6 @@ def main():
                     hand_count += 1
                     did_write = True
 
-                # -------------------------
-                # LEFT ERGONOMICS
-                # -------------------------
                 left_ergo_ts = data["left"]["ergonomics_timestamp"]
                 if left_ergo_ts is not None and left_ergo_ts != last_left_ergo_ts:
                     sample = {
@@ -157,9 +165,6 @@ def main():
                     ergonomics_count += 1
                     did_write = True
 
-                # -------------------------
-                # RIGHT ERGONOMICS
-                # -------------------------
                 right_ergo_ts = data["right"]["ergonomics_timestamp"]
                 if right_ergo_ts is not None and right_ergo_ts != last_right_ergo_ts:
                     sample = {
@@ -173,9 +178,6 @@ def main():
                     ergonomics_count += 1
                     did_write = True
 
-                # -------------------------
-                # LEFT BOARD
-                # -------------------------
                 left_board_ts = data["left_board_timestamp"]
                 if left_board_ts is not None and left_board_ts != last_left_board_ts:
                     sample = {
@@ -189,9 +191,6 @@ def main():
                     pose_count += 1
                     did_write = True
 
-                # -------------------------
-                # RIGHT BOARD
-                # -------------------------
                 right_board_ts = data["right_board_timestamp"]
                 if right_board_ts is not None and right_board_ts != last_right_board_ts:
                     sample = {
@@ -205,9 +204,6 @@ def main():
                     pose_count += 1
                     did_write = True
 
-                # -------------------------
-                # CUBE
-                # -------------------------
                 cube_ts = data["cube_timestamp"]
                 if cube_ts is not None and cube_ts != last_cube_ts:
                     sample = {

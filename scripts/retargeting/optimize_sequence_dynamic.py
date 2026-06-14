@@ -10,7 +10,7 @@ Wrist policy: position locked to ref; orientation = ref ⊗ exp(action delta).
 
 Inputs (per session):
     recordings/<session>/retargeted_sequence.npz   (Stage 2: SPIDER equality IK)
-    recordings/<session>/contact_sequence.npz      (Stage 2.5: spider_contact)
+    recordings/<session>/contact_sequence.npz      (Stage 2.5: detect_contacts)
 
 Output:
     recordings/<session>/retargeted_sequence_dynamic.npz
@@ -221,7 +221,7 @@ def run_session(
     if not retarget_path.exists():
         raise FileNotFoundError(
             f"missing {retarget_path.name}. "
-            "Run scripts.retargeting.retarget_sequence_spider first.")
+            "Run scripts.retargeting.kinematic_retargeting first.")
     if not contact_path.exists():
         raise FileNotFoundError(f"missing {contact_path}")
     if out_path.exists() and not force:
@@ -617,7 +617,7 @@ def main():
                              "inertia for a uniform solid cube. NOTE: contact "
                              "targets are cube-frame and assume the XML edge "
                              "length — for honest comparison, re-run Stage 2 "
-                             "(retarget_sequence_spider) with the new edge "
+                             "(kinematic_retargeting) with the new edge "
                              "and pass --stage2-tag to point at the rerun.")
     parser.add_argument("--cube-mass", type=float, default=None,
                         metavar="KG",
@@ -653,7 +653,7 @@ def main():
                         help="Suffix for the output npz: writes "
                              "retargeted_sequence_dynamic__<tag>.npz instead "
                              "of overwriting the canonical file. Use to keep "
-                             "sweep runs side by side for compare_dynamic.py.")
+                             "sweep runs side by side.")
     args = parser.parse_args()
 
     weights = _build_weights(args)

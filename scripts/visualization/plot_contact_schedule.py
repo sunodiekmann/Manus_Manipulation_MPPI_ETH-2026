@@ -6,13 +6,11 @@ For each of the 5 fingers, plots a stack of bands sharing a common x-axis:
                     tip. "If this finger touched something now, which face
                     would it touch?" Doesn't say whether contact is actually
                     happening; just the dominant cube-frame axis.
-  - scheduled face: spider_contact's per-frame segmented contact target,
+  - scheduled face: detect_contacts's per-frame segmented contact target,
                     coloured. Grey where the finger is not flagged as in
                     contact (NaN in contact_target_per_frame).
-  - mask          : black where spider_contact's contact_mask is True (tip
+  - mask          : black where detect_contacts's contact_mask is True (tip
                     geom collided with cube geom in mj_forward).
-  - manual        : optional band drawn only when manual_contacts.json is
-                    present; shows FORBIDDEN (black) or face-bound overrides.
   - SD (mm)       : signed distance of the FK tip to the nearest cube face,
                     drawn as a thin grey trace. 0 = on surface (dashed
                     reference line), positive = outside, negative = inside.
@@ -31,10 +29,7 @@ import matplotlib.pyplot as plt
 import mujoco
 import numpy as np
 
-from scripts.retargeting.manual_contacts import (
-    FORBIDDEN, UNCONSTRAINED, load_constraints,
-)
-from scripts.retargeting.spider_contact import _cube_face_id
+from scripts.retargeting.detect_contacts import _cube_face_id
 from scripts.utils.config import CUBE_SIZE
 from scripts.utils.transforms import pose_to_matrix
 
@@ -147,11 +142,6 @@ def plot_session(session_dir: Path, show: bool = False):
     contact_mask = np.asarray(cs["contact_mask"], dtype=bool)
 
     cleaned = _cleaned_face_per_frame(target_pf)
-    manual = load_constraints(session_dir, timeline)
-    if manual is not None:
-        print(f"  loaded manual constraints: "
-              f"{int((manual == FORBIDDEN).sum())} forbid, "
-              f"{int((manual >= 0).sum())} face-bound")
 
     print(f"  computing FK on Stage 2 qpos ({len(timeline)} frames) …")
     model = mujoco.MjModel.from_xml_path(str(PHYSICS_XML))
@@ -170,7 +160,6 @@ def plot_session(session_dir: Path, show: bool = False):
     )
 
     # Band y-coordinates (stacked top-to-bottom in each finger subplot).
-    BAND_MANUAL = (4.0, 4.3)     # manual-constraint indicator (top, if present)
     BAND_RAW = (3.2, 3.8)        # FK raw face id
     BAND_SCH = (2.4, 3.0)        # scheduled face id
     BAND_MASK = (2.05, 2.20)     # mask strip
@@ -178,24 +167,12 @@ def plot_session(session_dir: Path, show: bool = False):
     SD_BOTTOM = 0.4              # SD line band bottom
     SD_SCALE_MIN, SD_SCALE_MAX = -30.0, 30.0  # mm shown
     dt_med = float(np.median(np.diff(ts))) if N > 1 else 1.0
-    have_manual = manual is not None
 
     def _sd_to_norm(mm):
         frac = (np.clip(mm, SD_SCALE_MIN, SD_SCALE_MAX) - SD_SCALE_MIN) / (SD_SCALE_MAX - SD_SCALE_MIN)
         return SD_TOP - frac * (SD_TOP - SD_BOTTOM)
 
     for f, (ax, fn) in enumerate(zip(axes, FINGER_NAMES)):
-        if have_manual:
-            for t in range(N):
-                code = int(manual[t, f])
-                if code == UNCONSTRAINED:
-                    continue
-                color = "#000000" if code == FORBIDDEN else FACE_COLORS[code]
-                ax.add_patch(mpatches.Rectangle(
-                    (ts[t] - dt_med * 0.5, BAND_MANUAL[0]), dt_med,
-                    BAND_MANUAL[1] - BAND_MANUAL[0],
-                    facecolor=color, edgecolor="none",
-                ))
         _draw_face_band(ax, ts, raw_face[:, f], y_lo=BAND_RAW[0], y_hi=BAND_RAW[1])
         _draw_face_band(ax, ts, cleaned[:, f],  y_lo=BAND_SCH[0], y_hi=BAND_SCH[1])
         for t in range(N):
@@ -219,13 +196,9 @@ def plot_session(session_dir: Path, show: bool = False):
             (SD_TOP + SD_BOTTOM) / 2,
         ]
         ylabels = ["raw", "scheduled", "mask", "SD (mm)\n+30…0…−30"]
-        if have_manual:
-            yticks.append((BAND_MANUAL[0] + BAND_MANUAL[1]) / 2)
-            ylabels.append("manual")
         ax.set_yticks(yticks)
         ax.set_yticklabels(ylabels, fontsize=7)
-        ax.set_ylim(SD_BOTTOM - 0.1,
-                    (BAND_MANUAL[1] if have_manual else BAND_RAW[1]) + 0.1)
+        ax.set_ylim(SD_BOTTOM - 0.1, BAND_RAW[1] + 0.1)
         ax.set_ylabel(fn, fontsize=11, fontweight="bold", rotation=0,
                       labelpad=30, va="center")
         ax.grid(False)
@@ -240,8 +213,6 @@ def plot_session(session_dir: Path, show: bool = False):
     ] + [
         mpatches.Patch(facecolor=NO_CONTACT_COLOR, label="no contact"),
     ]
-    if have_manual:
-        legend_handles.append(mpatches.Patch(facecolor="#000000", label="manual: forbid"))
     fig.legend(handles=legend_handles, loc="upper center",
                ncol=8, fontsize=8, frameon=False, bbox_to_anchor=(0.5, 0.975))
 

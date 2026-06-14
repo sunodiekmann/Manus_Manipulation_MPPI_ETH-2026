@@ -22,9 +22,9 @@ Outputs `recordings/<session>/retargeted_sequence.npz`:
     wrist_offset     (3,)
 
 CLI:
-    python -m scripts.retargeting.retarget_sequence_spider recordings/<session>
-    python -m scripts.retargeting.retarget_sequence_spider recordings/<session> --viewer
-    python -m scripts.retargeting.retarget_sequence_spider recordings/<session> --force
+    python -m scripts.retargeting.kinematic_retargeting recordings/<session>
+    python -m scripts.retargeting.kinematic_retargeting recordings/<session> --viewer
+    python -m scripts.retargeting.kinematic_retargeting recordings/<session> --force
 """
 
 from __future__ import annotations

@@ -6,8 +6,8 @@ offline retargeter switched to SPIDER-style equality IK in the rewrite;
 runtime teleop still uses mink for its latency/safety profile).
 
 Usage:
-    python -m scripts.apps.run_tesollo_teleop_cube
-    python -m scripts.apps.run_tesollo_teleop_cube --offset 0.0043 0.0064 -0.0268
+    python -m scripts.visualization.live_teleop_cube
+    python -m scripts.visualization.live_teleop_cube --offset 0.0043 0.0064 -0.0268
 """
 import sys
 

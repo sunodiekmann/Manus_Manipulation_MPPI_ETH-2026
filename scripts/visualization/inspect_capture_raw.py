@@ -1,16 +1,18 @@
-"""
-Inspect a raw recording directly from the JSONL event streams.
+"""Inspect a raw recording directly from the JSONL event streams.
 
 Input:  recordings/<session>/hands.jsonl, ergonomics.jsonl, poses.jsonl
 
 What it does:
-  - Loads the raw, unsynchronised event streams as recorded by record_demo_sequence.py.
+  - Loads the raw, unsynchronised event streams as recorded by record_session.py.
   - Plots per-stream timestamps, arrival rates, and raw data values so you can
     quickly sanity-check whether all streams were running and at what frequency.
   - Useful for diagnosing recording issues (missing streams, dropped packets,
     timestamp jitter) before committing to the full processing pipeline.
 
 Run after recording, before build_sequence_dataset.py.
+
+Usage:
+    python -m scripts.visualization.inspect_capture_raw recordings/<session>
 """
 import json
 from pathlib import Path

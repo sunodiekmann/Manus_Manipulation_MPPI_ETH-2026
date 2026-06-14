@@ -1,5 +1,4 @@
-"""
-Inspect a processed sequence (.npz) with interactive plots.
+"""Inspect a processed sequence (.npz) with interactive plots.
 
 Input:  recordings/<session>/processed_sequence.npz
 
@@ -15,6 +14,9 @@ What it does:
     processing (compute_proxy_geometry) or evaluation.
 
 Run after build_sequence_dataset.py.
+
+Usage:
+    python -m scripts.visualization.inspect_capture_processed recordings/<session>
 """
 import json
 from pathlib import Path
